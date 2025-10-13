@@ -87,14 +87,24 @@ class FlorenceTagger:
     # prompts
     @property
     def caption_prompt(self) -> str:
-        return ("Write a vivid, specific caption for this image in one sentence. "
-                "Mention notable subjects, attributes, actions, and setting.")
+        return (
+            "caption examples:\n"
+            "photo of a dog playing in the park\n"
+            "portrait of a woman wearing a red hat\n"
+            "abstract painting with geometric shapes and bright colors\n"
+            "Now write a caption for this image:"
+        )
 
     @property
     def tags_prompt(self) -> str:
-        return ("Return 15 concise tags for this image, most specific first. "
-                "Use short nouns or adjectives, lowercase, no numbers, no stopwords, "
-                "comma-separated only (no extra text).")
+        return (
+            "tag examples:\n"
+            "dog, park, running, grass, playful\n"
+            "woman, red hat, portrait, fashion, studio\n"
+            "abstract, painting, geometric, colorful, modern\n"
+            "Now write tags for this image:"
+        )
+
 
     # shared generate helper with device/dtype casting (fixes float/half mismatch)
     def _gen(self, text, pil_img, max_new_tokens=96, num_beams=4):
