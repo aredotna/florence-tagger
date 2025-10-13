@@ -1,4 +1,5 @@
-import io, os
+import io
+import os
 from typing import List, Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -21,18 +22,22 @@ def load_image_from_s3(s3_uri: str) -> Image.Image:
     obj = s3.get_object(Bucket=bucket, Key=key)
     return Image.open(io.BytesIO(obj["Body"].read())).convert("RGB")
 
+
 # ---- Florence backend (caption → keywords) ----
 class FlorenceTagger:
     """
     Uses Florence-2 to produce a caption, then extracts keywords (noun phrases)
-    as "labels". If you later adopt a Florence checkpoint that outputs tags
-    natively, swap 'tag_from_caption' with a direct model call that returns tags.
+    as "labels". Later you can swap this for a tagging head if desired.
     """
     def __init__(self, model_id: str):
         import torch
         from transformers import AutoProcessor, AutoModelForCausalLM
+        import spacy
+
         self.torch = torch
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        print(f"Loading Florence model {model_id} on device {self.device}...")
         self.processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
         self.model = AutoModelForCausalLM.from_pretrained(
             model_id,
@@ -40,20 +45,21 @@ class FlorenceTagger:
             trust_remote_code=True
         ).to(self.device)
 
-        # lightweight keyphrase extraction (spaCy noun chunks)
-        import spacy
-        self.nlp = spacy.load("en_core_web_sm", disable=["ner", "parser"])
-        # we still need noun_chunks → enable parser temporarily for chunking
-        self.nlp.enable_pipe("parser")
+        print("Loading spaCy English model...")
+        self.nlp = spacy.load("en_core_web_sm")
 
-    @self_typed_property
-    def _caption_prompt(self):
-        # Many Florence checkpoints support simple caption prompts;
-        # if your checkpoint expects special tokens, set them here.
+    @property
+    def caption_prompt(self) -> str:
+        # Adjust if your checkpoint expects special prompt tokens
         return "Describe this image in a concise sentence."
 
-    def generate_caption(self, pil_img: Image.Image) -> str:
-        inputs = self.processor(text=self._caption_prompt, images=pil_img, return_tensors="pt").to(self.device)
+    def generate_caption(self, pil_img):
+        inputs = self.processor(
+            text=self.caption_prompt,
+            images=pil_img,
+            return_tensors="pt"
+        ).to(self.device)
+
         with self.torch.no_grad():
             out = self.model.generate(
                 **inputs,
@@ -64,45 +70,37 @@ class FlorenceTagger:
         caption = self.processor.batch_decode(out, skip_special_tokens=True)[0]
         return caption.strip()
 
-    def tag_from_caption(self, caption: str, top_k: int) -> List[dict]:
+    def tag_from_caption(self, caption: str, top_k: int):
         doc = self.nlp(caption)
-        # noun-chunk → simple normalize
         phrases = []
         for chunk in doc.noun_chunks:
             txt = chunk.text.strip().lower()
-            # normalize small stopwords-only chunks
             if len(txt) < 2:
                 continue
-            # keep alnum + space
             txt = "".join(ch for ch in txt if ch.isalnum() or ch == " ").strip()
             if not txt:
                 continue
             phrases.append(txt)
 
-        # Dedup while preserving order; keep single words & 2-grams mostly
         seen, kept = set(), []
         for p in phrases:
             if p not in seen:
                 seen.add(p)
                 kept.append(p)
 
-        # Simple scoring: frequent first, shorter phrases first
-        # (You can replace with RAKE/YAKE or embed-based salience later)
+        # Simple ranking: prefer shorter phrases; keep order otherwise
         ranked = sorted(kept, key=lambda s: (len(s.split()), s))
 
-        # Convert to Rekognition-like labels with heuristic confidences
         labels = []
         for i, term in enumerate(ranked[:top_k]):
-            conf = max(50.0, 100.0 - i * (40.0 / max(1, top_k-1)))  # 50–100 band
+            conf = max(50.0, 100.0 - i * (40.0 / max(1, top_k - 1)))  # 50–100 heuristic
             labels.append({"Name": term.title(), "Confidence": round(conf, 1)})
         return labels
 
-    def tag_image(self, pil_img: Image.Image, top_k: int) -> List[dict]:
+    def tag_image(self, pil_img, top_k: int):
         caption = self.generate_caption(pil_img)
         return self.tag_from_caption(caption, top_k), caption
 
-# small helper to allow property with self type hints (keeps mypy quiet if you use it)
-def self_typed_property(func): return property(func)
 
 # ---- API ----
 app = FastAPI(title="Florence Keyword Tagger")
@@ -112,12 +110,21 @@ class TagReq(BaseModel):
     top_k: Optional[int] = None
     include_caption: Optional[bool] = False
 
+
+print("Initializing FlorenceTagger...")
 TAGGER = FlorenceTagger(MODEL_ID)
+print("FlorenceTagger initialized.")
+
 
 @app.get("/health")
 def health():
     import torch
-    return {"ok": True, "backend": "florence", "device": "cuda" if torch.cuda.is_available() else "cpu"}
+    return {
+        "ok": True,
+        "backend": "florence",
+        "device": "cuda" if torch.cuda.is_available() else "cpu"
+    }
+
 
 @app.post("/tag")
 def tag(req: TagReq):
