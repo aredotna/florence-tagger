@@ -43,11 +43,37 @@ class FlorenceTagger:
     def caption_prompt(self) -> str:
         return "Describe this image in a concise sentence."
 
-    def generate_caption(self, pil_img: Image.Image) -> str:
-        inputs = self.processor(text=self.caption_prompt, images=pil_img, return_tensors="pt").to(self.device)
+    def generate_caption(self, pil_img):
+        inputs = self.processor(
+            text=self.caption_prompt,
+            images=pil_img,
+            return_tensors="pt"
+        )
+
+        # >>> ensure device + dtype match the model (fixes float vs half error)
+        device = self.device
+        dtype = getattr(self.model, "dtype", None)
+        casted = {}
+        for k, v in inputs.items():
+            if hasattr(v, "to"):
+                if dtype is not None and hasattr(v, "dtype") and v.dtype.is_floating_point:
+                    casted[k] = v.to(device=device, dtype=dtype)
+                else:
+                    casted[k] = v.to(device)
+            else:
+                casted[k] = v
+        inputs = casted
+        # <<<
+
         with self.torch.no_grad():
-            out = self.model.generate(**inputs, max_new_tokens=64, do_sample=False, num_beams=3)
-        return self.processor.batch_decode(out, skip_special_tokens=True)[0].strip()
+            out = self.model.generate(
+                **inputs,
+                max_new_tokens=64,
+                do_sample=False,
+                num_beams=3
+            )
+        caption = self.processor.batch_decode(out, skip_special_tokens=True)[0]
+        return caption.strip()
 
     def tag_from_caption(self, caption: str, top_k: int):
         doc = self.nlp(caption)
