@@ -1,22 +1,22 @@
+# Florence on GPU (A10G). No flash-attn needed.
 FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
 
-# system deps
 RUN apt-get update && apt-get install -y python3-pip git && rm -rf /var/lib/apt/lists/*
 RUN pip3 install --upgrade pip
 
 WORKDIR /app
 
-# Install CUDA-enabled PyTorch first (cu121 wheels)
+# 1) CUDA-enabled PyTorch (cu121 wheels)
 RUN pip3 install --no-cache-dir --index-url https://download.pytorch.org/whl/cu121 torch torchvision
 
-# Now the rest of the Python deps
+# 2) App deps
 COPY requirements.txt .
 RUN pip3 install --no-cache-dir -r requirements.txt
 
-# Download spaCy English model inside the image
+# 3) spaCy model
 RUN python3 -m spacy download en_core_web_sm
 
-# App code
+# 4) App
 COPY app.py ./
 
 EXPOSE 8000
