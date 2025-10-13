@@ -1,25 +1,70 @@
-import io, os
+import io
+import os
+import re
 from typing import Optional
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from PIL import Image
+from PIL import Image, ImageFile
 import boto3
 from botocore.config import Config
+from botocore.exceptions import ClientError
 
-S3_REGION = os.getenv("AWS_REGION", "us-east-1")
+# make PIL tolerant of slightly truncated files
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+# -----------------------------
+# Config
+# -----------------------------
+S3_REGION = os.getenv("AWS_REGION", "us-east-1")  # you can unset this if buckets live in multiple regions
 TOP_K_DEFAULT = int(os.getenv("TOP_K", "10"))
 MODEL_ID = os.getenv("FLORENCE_MODEL_ID", "microsoft/Florence-2-base")
 
+# optional: allow TF32 on Ampere+ for perf (harmless if unsupported)
+try:
+    import torch
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+except Exception:
+    pass
+
+
+# -----------------------------
+# S3 loader with clear errors
+# -----------------------------
 def load_image_from_s3(s3_uri: str) -> Image.Image:
     if not s3_uri.startswith("s3://"):
         raise HTTPException(status_code=400, detail="s3_uri must start with s3://")
     _, path = s3_uri.split("s3://", 1)
-    bucket, key = path.split("/", 1)
+    try:
+        bucket, key = path.split("/", 1)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="invalid s3_uri (missing key)")
+    # NOTE: if you hit region errors, remove region_name to let boto3 resolve automatically
     s3 = boto3.client("s3", region_name=S3_REGION, config=Config(signature_version="s3v4"))
-    obj = s3.get_object(Bucket=bucket, Key=key)
-    return Image.open(io.BytesIO(obj["Body"].read())).convert("RGB")
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=key)
+    except ClientError as e:
+        code = e.response["Error"].get("Code", "UnknownError")
+        msg = e.response["Error"].get("Message", str(e))
+        raise HTTPException(status_code=400, detail=f"S3 error {code}: {msg}")
+    try:
+        return Image.open(io.BytesIO(obj["Body"].read())).convert("RGB")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to decode image: {e}")
 
+
+# -----------------------------
+# Florence backend
+# -----------------------------
 class FlorenceTagger:
+    """
+    Uses Florence-2 to produce:
+      1) A vivid one-sentence caption
+      2) A comma-separated tag string (short nouns/adjectives, specific first)
+    Then converts tags -> Rekognition-like Labels.
+    """
+
     def __init__(self, model_id: str):
         import torch
         from transformers import AutoProcessor, AutoModelForCausalLM
@@ -39,80 +84,128 @@ class FlorenceTagger:
         print("[boot] loading spaCy en_core_web_sm …")
         self.nlp = spacy.load("en_core_web_sm")
 
+    # prompts
     @property
     def caption_prompt(self) -> str:
-        return "Describe this image in a concise sentence."
+        return ("Write a vivid, specific caption for this image in one sentence. "
+                "Mention notable subjects, attributes, actions, and setting.")
 
-    def generate_caption(self, pil_img):
-        inputs = self.processor(
-            text=self.caption_prompt,
-            images=pil_img,
-            return_tensors="pt"
-        )
+    @property
+    def tags_prompt(self) -> str:
+        return ("Return 15 concise tags for this image, most specific first. "
+                "Use short nouns or adjectives, lowercase, no numbers, no stopwords, "
+                "comma-separated only (no extra text).")
 
-        # >>> ensure device + dtype match the model (fixes float vs half error)
+    # shared generate helper with device/dtype casting (fixes float/half mismatch)
+    def _gen(self, text, pil_img, max_new_tokens=96, num_beams=4):
+        inputs = self.processor(text=text, images=pil_img, return_tensors="pt")
         device = self.device
         dtype = getattr(self.model, "dtype", None)
+
         casted = {}
         for k, v in inputs.items():
             if hasattr(v, "to"):
-                if dtype is not None and hasattr(v, "dtype") and v.dtype.is_floating_point:
+                if dtype is not None and hasattr(v, "dtype") and getattr(v, "dtype", None) and v.dtype.is_floating_point:
                     casted[k] = v.to(device=device, dtype=dtype)
                 else:
                     casted[k] = v.to(device)
             else:
                 casted[k] = v
-        inputs = casted
-        # <<<
 
         with self.torch.no_grad():
             out = self.model.generate(
-                **inputs,
-                max_new_tokens=64,
+                **casted,
+                max_new_tokens=max_new_tokens,
                 do_sample=False,
-                num_beams=3
+                num_beams=num_beams,
+                length_penalty=1.05,
             )
-        caption = self.processor.batch_decode(out, skip_special_tokens=True)[0]
-        return caption.strip()
+        return self.processor.batch_decode(out, skip_special_tokens=True)[0].strip()
 
-    def tag_from_caption(self, caption: str, top_k: int):
-        doc = self.nlp(caption)
+    def generate_caption(self, pil_img):
+        return self._gen(self.caption_prompt, pil_img, max_new_tokens=128, num_beams=5)
+
+    def generate_tags_text(self, pil_img):
+        return self._gen(self.tags_prompt, pil_img, max_new_tokens=64, num_beams=4)
+
+    # parse/clean Florence tag string -> Labels[]
+    def tags_to_labels(self, tag_str: str, top_k: int):
+        raw = [t.strip().lower() for t in tag_str.split(",")]
+        stop = {
+            "a", "an", "the", "and", "or", "of", "in", "on", "with", "without",
+            "to", "for", "by", "at", "from", "that", "this", "me", "photo", "image", "picture", "set"
+        }
+        cleaned = []
+        seen = set()
+        for t in raw:
+            t = "".join(ch for ch in t if ch.isalnum() or ch == " ").strip()
+            if not t or t in stop or len(t) < 2:
+                continue
+            # keep short, specific phrases
+            if len(t.split()) <= 4 and t not in seen:
+                seen.add(t)
+                cleaned.append(t)
+
+        # prefer shorter & lexicographic for stability (specific first already in model output)
+        cleaned = sorted(cleaned, key=lambda s: (len(s.split()), s))
+
+        labels = []
+        for i, term in enumerate(cleaned[:top_k]):
+            conf = max(55.0, 100.0 - i * (45.0 / max(1, top_k - 1)))  # 55–100 band
+            labels.append({"Name": term.title(), "Confidence": round(conf, 1)})
+        return labels
+
+    # simple backup: mine noun-ish chunks from the caption if tags were weak
+    def backup_labels_from_caption(self, caption: str, top_k: int):
         phrases = []
+        doc = self.nlp(caption)
         for chunk in doc.noun_chunks:
             txt = "".join(ch for ch in chunk.text.lower().strip() if ch.isalnum() or ch == " ").strip()
             if len(txt) >= 2:
                 phrases.append(txt)
-        # dedupe, prefer shorter phrases
         seen, kept = set(), []
         for p in phrases:
             if p not in seen:
                 seen.add(p)
                 kept.append(p)
-        kept.sort(key=lambda s: (len(s.split()), s))
+        kept = sorted(kept, key=lambda s: (len(s.split()), s))
         labels = []
         for i, term in enumerate(kept[:top_k]):
-            conf = max(50.0, 100.0 - i * (40.0 / max(1, top_k - 1)))
+            conf = max(50.0, 95.0 - i * (40.0 / max(1, top_k - 1)))
             labels.append({"Name": term.title(), "Confidence": round(conf, 1)})
         return labels
 
-    def tag_image(self, pil_img: Image.Image, top_k: int):
+    def tag_image(self, pil_img, top_k: int):
+        tag_text = self.generate_tags_text(pil_img)
         caption = self.generate_caption(pil_img)
-        return self.tag_from_caption(caption, top_k), caption
+        labels = self.tags_to_labels(tag_text, top_k)
+        if len(labels) < max(3, top_k // 2):
+            # fallback to caption-derived labels if Florence's tag string was too generic
+            labels = self.backup_labels_from_caption(caption, top_k)
+        return labels, caption
 
+
+# -----------------------------
+# API
+# -----------------------------
 app = FastAPI(title="Florence Keyword Tagger")
+
 print("[boot] initializing FlorenceTagger …")
 TAGGER = FlorenceTagger(MODEL_ID)
 print("[boot] ready.")
+
 
 class TagReq(BaseModel):
     s3_uri: str
     top_k: Optional[int] = None
     include_caption: Optional[bool] = False
 
+
 @app.get("/health")
 def health():
-    import torch
-    return {"ok": True, "backend": "florence", "device": "cuda" if torch.cuda.is_available() else "cpu"}
+    import torch as _torch
+    return {"ok": True, "backend": "florence", "device": "cuda" if _torch.cuda.is_available() else "cpu"}
+
 
 @app.post("/tag")
 def tag(req: TagReq):
