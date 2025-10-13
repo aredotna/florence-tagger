@@ -9,3 +9,4 @@ timm==0.9.16
 einops==0.7.0
 sentencepiece==0.2.0
 safetensors==0.4.3
+open-clip-torch==2.24.0
