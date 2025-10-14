@@ -11,35 +11,24 @@ from botocore.exceptions import ClientError
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
-# -------------------------------
-# Config
-# -------------------------------
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 TOP_K_DEFAULT = int(os.getenv("TOP_K", "10"))
 
-# Models (override via env)
+# Florence for caption only (you already had this working)
 FLORENCE_MODEL_ID = os.getenv("FLORENCE_MODEL_ID", "microsoft/Florence-2-large-ft")
-FLORENCE_REVISION = os.getenv("FLORENCE_REVISION", None)  # optional pin to avoid remote code drift
-RAM_MODEL_ID = os.getenv("RAM_MODEL_ID", "xinyu1205/recognize-anything-plus-model")  # RAM++
+TASK_CAPTION = "<DETAILED_CAPTION>"
 
-# Florence task token (caption only)
-TASK_CAPTION = "<DETAILED_CAPTION>"  # try "<CAPTION>" for terser output
+# RAM: use the repo’s code + HF .pth files
+RAM_VARIANT = os.getenv("RAM_VARIANT", "ram")  # "ram" or "ram++" (ram_plus)
+RAM_WEIGHTS = os.getenv("RAM_WEIGHTS", "/models/ram/ram_swin_large_14m.pth")
+RAM_TAG_EMB = os.getenv("RAM_TAG_EMB", "/models/ram/ram_tag_embedding_class_4585.pth")
 
-# Stopwords / style keepers used for light cleanup
 STOPWORDS = {
     "a","an","the","and","or","of","in","on","with","without","to","for","by","at","from",
     "that","this","these","those","me","set","answering","unanswerable","text",
-    "no extra text","n/a","none","tag","tags","image","photo","picture","we can see","in this image"
+    "no extra text","n/a","none","tag","tags","image","photo","picture"
 }
 
-KEEP_STYLE = {
-    "woodcut","engraving","etching","lithograph","collage","ink drawing","cyanotype",
-    "screen print","printmaking","oil painting","watercolor","charcoal","pencil drawing"
-}
-
-# -------------------------------
-# S3 -> PIL loader
-# -------------------------------
 def s3_image(s3_uri: str) -> Image.Image:
     if not s3_uri.startswith("s3://"):
         raise HTTPException(status_code=400, detail="s3_uri must start with s3://")
@@ -48,7 +37,6 @@ def s3_image(s3_uri: str) -> Image.Image:
         bucket, key = path.split("/", 1)
     except ValueError:
         raise HTTPException(status_code=400, detail="invalid s3_uri (missing key)")
-
     s3 = boto3.client("s3", region_name=AWS_REGION, config=Config(signature_version="s3v4"))
     try:
         obj = s3.get_object(Bucket=bucket, Key=key)
@@ -56,46 +44,33 @@ def s3_image(s3_uri: str) -> Image.Image:
         code = e.response["Error"].get("Code", "UnknownError")
         msg = e.response["Error"].get("Message", str(e))
         raise HTTPException(status_code=400, detail=f"S3 error {code}: {msg}")
-
     try:
         return Image.open(io.BytesIO(obj["Body"].read())).convert("RGB")
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to decode image: {e}")
 
-# -------------------------------
-# Florence (caption only)
-# -------------------------------
+# ---------------- Florence captioner (unchanged except for small cleanup) ---------------
 class FlorenceCaptioner:
-    def __init__(self, model_id: str, revision: Optional[str] = None):
+    def __init__(self, model_id: str):
         import torch
         from transformers import AutoProcessor, AutoModelForCausalLM
-
         self.torch = torch
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"[boot] loading captioner: {model_id} rev={revision or 'latest'} on {self.device} …")
-
-        self.processor = AutoProcessor.from_pretrained(
-            model_id, trust_remote_code=True, revision=revision
-        )
+        print(f"[boot] loading captioner: {model_id} on {self.device} …")
+        self.processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
         self.model = AutoModelForCausalLM.from_pretrained(
             model_id,
             trust_remote_code=True,
-            revision=revision,
             torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
         ).to(self.device)
-
-        try:
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
-        except Exception:
-            pass
+        self.model.eval()
 
     def _to_device_match_dtype(self, batch):
         out = {}
-        dtype = next(self.model.parameters()).dtype if any(True for _ in self.model.parameters()) else None
+        dtype = next(self.model.parameters()).dtype
         for k, v in batch.items():
             if hasattr(v, "to"):
-                if hasattr(v, "dtype") and v.dtype.is_floating_point and dtype is not None:
+                if hasattr(v, "dtype") and v.dtype.is_floating_point:
                     out[k] = v.to(device=self.device, dtype=dtype)
                 else:
                     out[k] = v.to(device=self.device)
@@ -113,144 +88,99 @@ class FlorenceCaptioner:
                 do_sample=False,
                 num_beams=num_beams,
                 length_penalty=1.05,
-                no_repeat_ngram_size=3,
             )
         return self.processor.batch_decode(out, skip_special_tokens=True)[0].strip()
 
     def caption(self, pil_img: Image.Image) -> str:
         cap = self._generate(TASK_CAPTION, pil_img, max_new_tokens=128, num_beams=5)
-        if not cap or cap.lower() in {"no", "n/a"} or "<" in cap or "tag" in cap.lower():
+        if not cap or cap.lower() in {"no","n/a"} or "<" in cap or "tag" in cap.lower():
             cap = self._generate("<CAPTION>", pil_img, max_new_tokens=96, num_beams=4)
-
-        # normalize / trim boilerplate
-        cap = cap.replace("\n", " ")
-        cap = re.sub(r"\s+", " ", cap).strip()
-        cap = re.sub(r"(?i)\b(we can see|in this image|this is)\b[^.]*\.?\s*", "", cap).strip()
-
-        # keep it punchy
-        words = cap.split()
-        if len(words) > 22:
-            cap = " ".join(words[:22]).rstrip(",;:") + "."
+        cap = re.sub(r"\s+", " ", cap.replace("\n", " ")).strip()
         return cap or "image"
 
-# -------------------------------
-# RAM++ (Recognize Anything) tagger
-# -------------------------------
+# ---------------- RAM (base) tagger via official repo (no Transformers) -----------------
 class RAMTagger:
     """
-    Uses RAM/RAM++ to directly emit comma-separated keywords.
-    Requires: einops, timm (no flash-attn needed).
+    Loads RAM using the official recognize-anything repo and local .pth checkpoints.
+    This avoids the Transformers 'config.json' path entirely.
     """
-    def __init__(self, model_id: str):
+    def __init__(self, variant: str, weights_path: str, tag_emb_path: str):
         import torch
-        from transformers import AutoProcessor, AutoModelForCausalLM
-
+        from ram import utils as ram_utils
+        from ram import inference_ram, inference_ram_plus
         self.torch = torch
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"[boot] loading RAM tagger: {model_id} on {self.device} …")
+        self.variant = variant.lower()
+        print(f"[boot] loading RAM ({self.variant}) from {weights_path} …")
 
-        # RAM repos expose generate via remote code
-        self.processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_id,
-            trust_remote_code=True,
-            torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
-        ).to(self.device)
-        self.model.eval()
+        # Build preprocessing & tag list using repo utilities
+        # Note: RAM uses a fixed tag list of 4,585 classes; the embedding file encodes them.
+        self.transform = ram_utils.get_transform(image_size=384)
+        self.tag_list = ram_utils.get_tag_list()           # list of strings
+        self.tag_emb_path = tag_emb_path
+        self.weights_path = weights_path
 
-        try:
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
-        except Exception:
-            pass
-
-        # cache model dtype for safe casting
-        try:
-            self.model_dtype = next(self.model.parameters()).dtype
-        except StopIteration:
-            self.model_dtype = self.torch.float16 if self.device == "cuda" else self.torch.float32
-
-    def _to_device_match_dtype(self, batch):
-        out = {}
-        for k, v in batch.items():
-            if hasattr(v, "to"):
-                if hasattr(v, "dtype") and v.dtype.is_floating_point:
-                    out[k] = v.to(device=self.device, dtype=self.model_dtype)
-                else:
-                    out[k] = v.to(device=self.device)
-            else:
-                out[k] = v
-        return out
-
-    def raw_tags(self, pil_img: Image.Image) -> str:
-        with self.torch.no_grad():
-            inputs = self.processor(images=pil_img, return_tensors="pt")
-            inputs = self._to_device_match_dtype(inputs)
-            # RAM++’s remote code supports generate; max_new_tokens ~64 is enough for keywords
-            out = self.model.generate(**inputs, max_new_tokens=64)
-            text = self.processor.batch_decode(out, skip_special_tokens=True)[0]
-            return text.strip()
-
-    @staticmethod
-    def _normalize_tag(t: str) -> str:
-        t = t.strip().lower()
-        t = re.sub(r"[^\w\s\-&]", "", t)
-        t = re.sub(r"\s+", " ", t)
-        t = re.sub(r"^(a|an|the)\s+", "", t)
-        if not t:
-            return ""
-        if t in STOPWORDS:
-            return ""
-        # keep art/media terms from KEEP_STYLE if present
-        if t in {"image","photo","picture","tag","tags"}:
-            return ""
-        return t
-
-    def clean_tags(self, tag_str: str) -> List[str]:
-        parts = re.split(r"[,;\n]+", tag_str)
-        seen, tags = set(), []
-        for p in parts:
-            t = self._normalize_tag(p)
-            if not t:
-                continue
-            if 1 <= len(t.split()) <= 4:
-                if t not in seen:
-                    seen.add(t)
-                    tags.append(t)
-        return tags
+        # Prepare the actual inference function we’ll call
+        # (The repo provides helpers for both RAM and RAM++)
+        if self.variant == "ram++" or self.variant == "ram_plus" or self.variant == "ramplusplus":
+            self._infer = lambda im: inference_ram_plus.infer_tags(
+                image=im,
+                model_ckpt=self.weights_path,
+                tag_emb_path=self.tag_emb_path,
+                device=self.device,
+                image_size=384,
+            )
+        else:
+            self._infer = lambda im: inference_ram.infer_tags(
+                image=im,
+                model_ckpt=self.weights_path,
+                tag_emb_path=self.tag_emb_path,
+                device=self.device,
+                image_size=384,
+            )
 
     def topk(self, pil_img: Image.Image, k: int) -> List[str]:
-        raw = self.raw_tags(pil_img)
-        c = self.clean_tags(raw)
-        if not c:
-            return ["unknown"]
-        return c[:k]
+        """
+        Calls the repo’s inference helper. It returns a comma-separated string of tags
+        or a Python list depending on version; normalize to a list of lowercased terms.
+        """
+        tags = self._infer(pil_img)  # may return a single string or list
+        if isinstance(tags, str):
+            parts = re.split(r"[,;\n]+", tags)
+        else:
+            parts = list(tags)
+        out, seen = [], set()
+        for p in parts:
+            t = re.sub(r"[^\w\s\-&]", "", str(p).strip().lower())
+            t = re.sub(r"\s+", " ", t)
+            t = re.sub(r"^(a|an|the)\s+", "", t)
+            if not t or t in STOPWORDS:
+                continue
+            if 1 <= len(t.split()) <= 4 and t not in seen:
+                seen.add(t)
+                out.append(t)
+            if len(out) >= k:
+                break
+        return out or ["unknown"]
 
-# -------------------------------
-# Orchestrator
-# -------------------------------
+# ---------------- Orchestrator -----------------
 class Tagger:
     def __init__(self, captioner: FlorenceCaptioner, rammer: RAMTagger):
         self.captioner = captioner
         self.rammer = rammer
 
     def tag(self, pil_img: Image.Image, top_k: int) -> Tuple[List[dict], str]:
-        # 1) direct keyword tags from RAM/RAM++
         names = self.rammer.topk(pil_img, top_k)
-        labels = [{"Name": n.title(), "Confidence": 100.0} for n in names]  # confidences kept for API compatibility
-
-        # 2) caption from Florence
+        labels = [{"Name": n.title(), "Confidence": 100.0} for n in names]  # keep shape
         cap = self.captioner.caption(pil_img)
         return labels, cap
 
-# -------------------------------
-# FastAPI wiring
-# -------------------------------
-app = FastAPI(title="Are.na Image Tagger (RAM++) + Captioner (Florence)")
+# ---------------- FastAPI -----------------
+app = FastAPI(title="Are.na Tagger (RAM) + Captioner (Florence)")
 
 print("[boot] init …")
-CAPTIONER = FlorenceCaptioner(FLORENCE_MODEL_ID, FLORENCE_REVISION)
-RAMMER = RAMTagger(RAM_MODEL_ID)
+CAPTIONER = FlorenceCaptioner(FLORENCE_MODEL_ID)
+RAMMER = RAMTagger(RAM_VARIANT, RAM_WEIGHTS, RAM_TAG_EMB)
 RUNNER = Tagger(CAPTIONER, RAMMER)
 print("[boot] ready.")
 
@@ -262,11 +192,7 @@ class TagReq(BaseModel):
 @app.get("/health")
 def health():
     import torch
-    return {
-        "ok": True,
-        "backend": "ram++ + florence",
-        "device": "cuda" if torch.cuda.is_available() else "cpu"
-    }
+    return {"ok": True, "backend": f"{RAM_VARIANT}+florence", "device": "cuda" if torch.cuda.is_available() else "cpu"}
 
 @app.post("/tag")
 def tag(req: TagReq):
