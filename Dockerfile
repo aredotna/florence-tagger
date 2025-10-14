@@ -1,7 +1,7 @@
-# Simple Python 3.10 image
-FROM python:3.10-slim
+# PyTorch base image for CLIP
+FROM pytorch/pytorch:2.1.0-cuda11.8-cudnn8-devel
 
-RUN apt-get update && apt-get install -y && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --upgrade pip setuptools wheel
 

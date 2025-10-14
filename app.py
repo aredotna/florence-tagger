@@ -43,162 +43,141 @@ def s3_image(s3_uri: str) -> Image.Image:
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to decode image: {e}")
 
-# ---------------- Simple Image Analyzer (no complex model loading) ---------------
-class SimpleImageAnalyzer:
+# ---------------- BLIP-2 Image Tagger (dynamic, no hardcoded lists) ---------------
+class BLIPTagger:
     def __init__(self):
-        print("[boot] initializing simple image analyzer...")
-        print("[boot] ready - no complex models to load!")
+        import torch
+        from transformers import BlipProcessor, BlipForConditionalGeneration
+        
+        self.torch = torch
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        
+        print(f"[boot] loading BLIP-2 on {self.device}...")
+        self.processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
+        self.model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base").to(self.device)
+        print("[boot] BLIP-2 loaded successfully!")
 
     def caption(self, pil_img: Image.Image) -> str:
-        """Generate a simple caption based on image properties"""
-        width, height = pil_img.size
-        
-        # Basic image analysis
-        aspect_ratio = width / height
-        total_pixels = width * height
-        
-        # Determine orientation
-        if aspect_ratio > 1.5:
-            orientation = "wide landscape"
-        elif aspect_ratio < 0.67:
-            orientation = "tall portrait"
-        elif aspect_ratio > 1.1:
-            orientation = "landscape"
-        elif aspect_ratio < 0.9:
-            orientation = "portrait"
-        else:
-            orientation = "square"
-        
-        # Determine resolution
-        if total_pixels > 2000000:  # > 2MP
-            resolution = "high resolution"
-        elif total_pixels > 500000:  # > 0.5MP
-            resolution = "medium resolution"
-        else:
-            resolution = "low resolution"
-        
-        # Analyze dominant colors
-        colors = self._get_dominant_colors(pil_img)
-        
-        # Create caption
-        caption_parts = [f"{orientation} image", resolution]
-        if colors:
-            caption_parts.append(f"with {colors[0]} tones")
-        
-        return " ".join(caption_parts)
+        """Generate a detailed caption using BLIP-2"""
+        try:
+            inputs = self.processor(images=pil_img, return_tensors="pt").to(self.device)
+            
+            with self.torch.no_grad():
+                generated_ids = self.model.generate(
+                    **inputs,
+                    max_length=50,
+                    num_beams=5,
+                    temperature=0.7,
+                    do_sample=True,
+                )
+            
+            caption = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
+            return caption or "an image"
+            
+        except Exception as e:
+            print(f"[error] BLIP caption generation failed: {e}")
+            return "an image"
 
     def extract_tags(self, pil_img: Image.Image, top_k: int = 10) -> List[str]:
-        """Extract tags based on image analysis"""
-        width, height = pil_img.size
-        tags = []
-        
-        # Orientation tags
-        aspect_ratio = width / height
-        if aspect_ratio > 1.5:
-            tags.extend(["landscape", "wide", "panoramic"])
-        elif aspect_ratio < 0.67:
-            tags.extend(["portrait", "tall", "vertical"])
-        elif aspect_ratio > 1.1:
-            tags.extend(["landscape", "horizontal"])
-        elif aspect_ratio < 0.9:
-            tags.extend(["portrait", "vertical"])
-        else:
-            tags.extend(["square", "balanced"])
-        
-        # Resolution tags
-        total_pixels = width * height
-        if total_pixels > 2000000:
-            tags.extend(["high resolution", "detailed", "sharp"])
-        elif total_pixels > 500000:
-            tags.extend(["medium resolution", "clear"])
-        else:
-            tags.extend(["low resolution", "small"])
-        
-        # Color analysis
-        colors = self._get_dominant_colors(pil_img)
-        if colors:
-            tags.extend(colors[:3])  # Top 3 colors
-        
-        # Size categories
-        if width > 2000 or height > 2000:
-            tags.append("large")
-        elif width < 500 or height < 500:
-            tags.append("small")
-        else:
-            tags.append("medium")
-        
-        # Remove duplicates and limit
-        unique_tags = []
-        for tag in tags:
-            if tag not in unique_tags and tag not in STOPWORDS:
-                unique_tags.append(tag)
-        
-        return unique_tags[:top_k] if unique_tags else ["image", "photo"]
-
-    def _get_dominant_colors(self, pil_img: Image.Image) -> List[str]:
-        """Get dominant colors from the image"""
+        """Extract meaningful tags using BLIP-2 with dynamic prompts"""
         try:
-            # Resize for faster processing
-            small_img = pil_img.resize((150, 150))
+            # Generate multiple captions with different prompts to get diverse tags
+            prompts = [
+                "Describe this image in detail:",
+                "What objects are in this image?",
+                "What is happening in this image?",
+                "List the main subjects in this image:",
+                "What can you see in this image?"
+            ]
             
-            # Convert to RGB if needed
-            if small_img.mode != 'RGB':
-                small_img = small_img.convert('RGB')
+            all_tags = []
             
-            # Get color data
-            colors = small_img.getcolors(maxcolors=256*256*256)
-            if not colors:
-                return []
+            for prompt in prompts:
+                try:
+                    inputs = self.processor(images=pil_img, text=prompt, return_tensors="pt").to(self.device)
+                    
+                    with self.torch.no_grad():
+                        generated_ids = self.model.generate(
+                            **inputs,
+                            max_length=30,
+                            num_beams=3,
+                            temperature=0.8,
+                            do_sample=True,
+                        )
+                    
+                    response = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
+                    
+                    # Extract meaningful words from the response
+                    words = self._extract_meaningful_words(response)
+                    all_tags.extend(words)
+                    
+                except Exception as e:
+                    print(f"[error] BLIP prompt '{prompt}' failed: {e}")
+                    continue
             
-            # Sort by frequency
-            colors.sort(key=lambda x: x[0], reverse=True)
+            # Remove duplicates and filter
+            unique_tags = []
+            for tag in all_tags:
+                if tag not in unique_tags and tag not in STOPWORDS and len(tag) > 2:
+                    unique_tags.append(tag)
             
-            # Convert RGB to color names
-            color_names = []
-            for count, (r, g, b) in colors[:5]:  # Top 5 colors
-                color_name = self._rgb_to_color_name(r, g, b)
-                if color_name and color_name not in color_names:
-                    color_names.append(color_name)
+            return unique_tags[:top_k] if unique_tags else ["image", "photo"]
             
-            return color_names
-        except Exception:
-            return []
+        except Exception as e:
+            print(f"[error] BLIP tag extraction failed: {e}")
+            return ["image", "photo"]
 
-    def _rgb_to_color_name(self, r: int, g: int, b: int) -> str:
-        """Convert RGB values to color names"""
-        # Simple color classification
-        if r > 200 and g > 200 and b > 200:
-            return "bright"
-        elif r < 50 and g < 50 and b < 50:
-            return "dark"
-        elif r > g and r > b and r - max(g, b) > 50:
-            return "red"
-        elif g > r and g > b and g - max(r, b) > 50:
-            return "green"
-        elif b > r and b > g and b - max(r, g) > 50:
-            return "blue"
-        elif r > 150 and g > 150 and b < 100:
-            return "yellow"
-        elif r > 150 and g < 100 and b > 150:
-            return "purple"
-        elif r < 100 and g > 150 and b > 150:
-            return "cyan"
-        elif r > 150 and g > 100 and g < 150 and b < 100:
-            return "orange"
-        elif r > 100 and g > 100 and b > 100:
-            return "light"
-        else:
-            return "neutral"
+    def _extract_meaningful_words(self, text: str) -> List[str]:
+        """Extract meaningful words from BLIP response"""
+        import re
+        
+        # Clean up the text
+        text = text.lower().strip()
+        
+        # Remove common prefixes
+        prefixes_to_remove = [
+            "describe this image in detail:",
+            "what objects are in this image?",
+            "what is happening in this image?",
+            "list the main subjects in this image:",
+            "what can you see in this image?",
+            "this image shows",
+            "this is a",
+            "this is an",
+            "the image shows",
+            "the image contains",
+            "there is a",
+            "there is an",
+            "there are",
+        ]
+        
+        for prefix in prefixes_to_remove:
+            if text.startswith(prefix):
+                text = text[len(prefix):].strip()
+        
+        # Split into words and clean them
+        words = re.findall(r'\b[a-zA-Z]{3,}\b', text)
+        
+        # Filter out common words and keep meaningful ones
+        meaningful_words = []
+        for word in words:
+            if (word not in STOPWORDS and 
+                len(word) > 2 and 
+                word.isalpha() and
+                word not in ["image", "photo", "picture", "shows", "contains", "there"]):
+                meaningful_words.append(word)
+        
+        return meaningful_words
 
 # ---------------- Orchestrator -----------------
 class Tagger:
-    def __init__(self, analyzer: SimpleImageAnalyzer):
-        self.analyzer = analyzer
+    def __init__(self, blip_tagger: BLIPTagger):
+        self.blip_tagger = blip_tagger
 
     def tag(self, pil_img: Image.Image, top_k: int) -> Tuple[List[dict], str]:
-        # Get tags and caption from simple analyzer
-        tags = self.analyzer.extract_tags(pil_img, top_k)
-        caption = self.analyzer.caption(pil_img)
+        # Get tags and caption from BLIP-2
+        tags = self.blip_tagger.extract_tags(pil_img, top_k)
+        caption = self.blip_tagger.caption(pil_img)
         
         # Format tags as expected by the API
         labels = [{"Name": tag.title(), "Confidence": 100.0} for tag in tags]
@@ -206,11 +185,11 @@ class Tagger:
         return labels, caption
 
 # ---------------- FastAPI -----------------
-app = FastAPI(title="Are.na Tagger (Simple Image Analysis)")
+app = FastAPI(title="Are.na Tagger (BLIP-2)")
 
 print("[boot] init …")
-ANALYZER = SimpleImageAnalyzer()
-RUNNER = Tagger(ANALYZER)
+BLIP_TAGGER = BLIPTagger()
+RUNNER = Tagger(BLIP_TAGGER)
 print("[boot] ready.")
 
 class TagReq(BaseModel):
@@ -220,7 +199,8 @@ class TagReq(BaseModel):
 
 @app.get("/health")
 def health():
-    return {"ok": True, "backend": "simple-image-analyzer", "device": "cpu"}
+    import torch
+    return {"ok": True, "backend": "blip-2", "device": "cuda" if torch.cuda.is_available() else "cpu"}
 
 @app.post("/tag")
 def tag(req: TagReq):
