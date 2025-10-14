@@ -23,61 +23,68 @@ def s3_image(s3_uri: str) -> Image.Image:
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to decode image: {e}")
 
-# ---------------- Simple BLIP Captioner ---------------
+# ---------------- BLIP-2 Captioner ---------------
 class BLIPCaptioner:
     def __init__(self):
-        print("[boot] Loading BLIP model...")
+        print("[boot] Loading BLIP-2 model...")
         
         try:
-            from transformers import BlipProcessor, BlipForConditionalGeneration
+            from transformers import Blip2Processor, Blip2ForConditionalGeneration
             import torch
             
             self.device = "cuda" if torch.cuda.is_available() else "cpu"
             print(f"[boot] Using device: {self.device}")
             
-            # Use the base BLIP model (smaller, more reliable)
-            model_name = "Salesforce/blip-image-captioning-base"
+            # Use BLIP-2 for much better captions (2.7B parameters)
+            model_name = "Salesforce/blip2-opt-2.7b"
             
-            self.processor = BlipProcessor.from_pretrained(model_name)
-            self.model = BlipForConditionalGeneration.from_pretrained(model_name)
+            self.processor = Blip2Processor.from_pretrained(model_name)
+            self.model = Blip2ForConditionalGeneration.from_pretrained(model_name)
             
             if self.device == "cuda":
                 self.model = self.model.to(self.device)
             
-            print("[boot] BLIP model loaded successfully!")
+            print("[boot] BLIP-2 model loaded successfully!")
             
         except Exception as e:
-            print(f"[boot] Error loading BLIP: {e}")
+            print(f"[boot] Error loading BLIP-2: {e}")
             raise e
 
     def caption(self, pil_img: Image.Image) -> str:
-        """Generate a clean caption for the image"""
+        """Generate a detailed caption for the image using BLIP-2"""
         try:
             import torch
             
-            # Simple, clean approach - no prompts, just image captioning
-            inputs = self.processor(images=pil_img, return_tensors="pt")
+            # BLIP-2 can handle prompts for better descriptions
+            prompt = "Describe this image in detail:"
+            
+            inputs = self.processor(images=pil_img, text=prompt, return_tensors="pt")
             
             if self.device == "cuda":
                 inputs = {k: v.to(self.device) for k, v in inputs.items()}
             
-            # Generate caption with conservative settings
+            # Generate caption with better parameters for detailed descriptions
             with torch.no_grad():
                 generated_ids = self.model.generate(
                     **inputs,
-                    max_length=50,
-                    num_beams=3,
-                    temperature=0.6,
-                    do_sample=False,  # Use beam search for more consistent results
+                    max_length=100,  # Longer captions
+                    num_beams=5,      # Better quality
+                    temperature=0.7,  # Slightly more creative
+                    do_sample=True,   # Allow sampling for variety
                     early_stopping=True,
+                    repetition_penalty=1.1,
                 )
             
             # Decode caption
             caption = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
             
-            # Clean up caption
+            # Clean up caption - remove the prompt if it appears
+            if prompt.lower() in caption.lower():
+                caption = caption.replace(prompt, "").strip()
+            
+            # Clean up any remaining artifacts
             caption = caption.strip()
-            if not caption or caption.lower() in ["", "image", "photo"]:
+            if not caption or caption.lower() in ["", "image", "photo", "picture"]:
                 return "an image"
             
             return caption
@@ -98,7 +105,7 @@ class CaptionRequest(BaseModel):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "image-caption"}
+    return {"status": "ok", "service": "blip2-captioner"}
 
 @app.post("/caption")
 def caption_image(req: CaptionRequest):
@@ -121,14 +128,14 @@ def caption_image(req: CaptionRequest):
 # Legacy endpoint for compatibility
 @app.post("/tag")
 def tag_image(req: CaptionRequest):
-    """Legacy endpoint that returns caption in old format"""
+    """Legacy endpoint that returns caption only"""
     try:
         img = s3_image(req.s3_uri)
         caption = CAPTIONER.caption(img)
         
         return {
-            "Labels": [{"Name": "Caption", "Confidence": 100.0}],
-            "Caption": caption
+            "caption": caption,
+            "s3_uri": req.s3_uri
         }
         
     except Exception as e:
