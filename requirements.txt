@@ -5,3 +5,4 @@ boto3==1.35.14
 transformers==4.35.2
 torch==2.1.0
 torchvision==0.16.0
+numpy<2.0
