@@ -9,6 +9,7 @@ import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
+
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
@@ -107,37 +108,26 @@ class RAMTagger:
     def __init__(self, variant: str, weights_path: str, tag_emb_path: str):
         import torch
         from ram import utils as ram_utils
-        from ram import inference_ram, inference_ram_plus
+        from ram import inference_ram
         self.torch = torch
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.variant = variant.lower()
-        print(f"[boot] loading RAM ({self.variant}) from {weights_path} …")
 
-        # Build preprocessing & tag list using repo utilities
-        # Note: RAM uses a fixed tag list of 4,585 classes; the embedding file encodes them.
+        print(f"[boot] loading RAM (ram) from {weights_path} …")
+
         self.transform = ram_utils.get_transform(image_size=384)
-        self.tag_list = ram_utils.get_tag_list()           # list of strings
+        self.tag_list = ram_utils.get_tag_list()
         self.tag_emb_path = tag_emb_path
         self.weights_path = weights_path
 
-        # Prepare the actual inference function we’ll call
-        # (The repo provides helpers for both RAM and RAM++)
-        if self.variant == "ram++" or self.variant == "ram_plus" or self.variant == "ramplusplus":
-            self._infer = lambda im: inference_ram_plus.infer_tags(
-                image=im,
-                model_ckpt=self.weights_path,
-                tag_emb_path=self.tag_emb_path,
-                device=self.device,
-                image_size=384,
-            )
-        else:
-            self._infer = lambda im: inference_ram.infer_tags(
-                image=im,
-                model_ckpt=self.weights_path,
-                tag_emb_path=self.tag_emb_path,
-                device=self.device,
-                image_size=384,
-            )
+        # base RAM only
+        self._infer = lambda im: inference_ram.infer_tags(
+            image=im,
+            model_ckpt=self.weights_path,
+            tag_emb_path=self.tag_emb_path,
+            device=self.device,
+            image_size=384,
+        )
 
     def topk(self, pil_img: Image.Image, k: int) -> List[str]:
         """
