@@ -23,54 +23,54 @@ def s3_image(s3_uri: str) -> Image.Image:
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to decode image: {e}")
 
-# ---------------- BLIP-2 Captioner ---------------
+# ---------------- InstructBLIP Captioner ---------------
 class BLIPCaptioner:
     def __init__(self):
-        print("[boot] Loading BLIP-2 model...")
+        print("[boot] Loading InstructBLIP model...")
         
         try:
-            from transformers import Blip2Processor, Blip2ForConditionalGeneration
+            from transformers import InstructBlipProcessor, InstructBlipForConditionalGeneration
             import torch
             
             self.device = "cuda" if torch.cuda.is_available() else "cpu"
             print(f"[boot] Using device: {self.device}")
             
-            # Use BLIP-2 for much better captions (2.7B parameters)
-            model_name = "Salesforce/blip2-opt-2.7b"
+            # Use InstructBLIP for excellent captions (much more stable than BLIP-2)
+            model_name = "Salesforce/instructblip-vicuna-7b"
             
-            self.processor = Blip2Processor.from_pretrained(model_name)
-            self.model = Blip2ForConditionalGeneration.from_pretrained(model_name)
+            self.processor = InstructBlipProcessor.from_pretrained(model_name)
+            self.model = InstructBlipForConditionalGeneration.from_pretrained(model_name)
             
             if self.device == "cuda":
                 self.model = self.model.to(self.device)
             
-            print("[boot] BLIP-2 model loaded successfully!")
+            print("[boot] InstructBLIP model loaded successfully!")
             
         except Exception as e:
-            print(f"[boot] Error loading BLIP-2: {e}")
+            print(f"[boot] Error loading InstructBLIP: {e}")
             raise e
 
     def caption(self, pil_img: Image.Image) -> str:
-        """Generate a detailed caption for the image using BLIP-2"""
+        """Generate a detailed caption for the image using InstructBLIP"""
         try:
             import torch
             
-            # BLIP-2 can handle prompts for better descriptions
-            prompt = "Describe this image in detail:"
+            # InstructBLIP excels at following detailed prompts
+            prompt = "Describe this image in detail, including the setting, objects, people, and any notable features:"
             
             inputs = self.processor(images=pil_img, text=prompt, return_tensors="pt")
             
             if self.device == "cuda":
                 inputs = {k: v.to(self.device) for k, v in inputs.items()}
             
-            # Generate caption with better parameters for detailed descriptions
+            # Generate caption with optimized parameters for detailed descriptions
             with torch.no_grad():
                 generated_ids = self.model.generate(
                     **inputs,
-                    max_length=100,  # Longer captions
-                    num_beams=5,      # Better quality
-                    temperature=0.7,  # Slightly more creative
-                    do_sample=True,   # Allow sampling for variety
+                    max_length=150,  # Even longer captions
+                    num_beams=5,      # High quality
+                    temperature=0.7,  # Balanced creativity
+                    do_sample=True,   # Allow variety
                     early_stopping=True,
                     repetition_penalty=1.1,
                 )
@@ -105,7 +105,7 @@ class CaptionRequest(BaseModel):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "blip2-captioner"}
+    return {"status": "ok", "service": "instructblip-captioner"}
 
 @app.post("/caption")
 def caption_image(req: CaptionRequest):
