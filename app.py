@@ -53,6 +53,8 @@ class BLIPCaptioner:
     def caption(self, pil_img: Image.Image) -> str:
         """Generate a caption for the image"""
         try:
+            import torch
+            
             # Process image
             inputs = self.processor(images=pil_img, return_tensors="pt")
             
