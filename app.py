@@ -15,14 +15,7 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 TOP_K_DEFAULT = int(os.getenv("TOP_K", "10"))
 
-# Florence for caption only (you already had this working)
-FLORENCE_MODEL_ID = os.getenv("FLORENCE_MODEL_ID", "microsoft/Florence-2-large-ft")
-TASK_CAPTION = "<DETAILED_CAPTION>"
-
-# RAM: use the repo’s code + HF .pth files
-RAM_VARIANT = os.getenv("RAM_VARIANT", "ram")  # "ram" or "ram++" (ram_plus)
-RAM_WEIGHTS = os.getenv("RAM_WEIGHTS", "/models/ram/ram_swin_large_14m.pth")
-RAM_TAG_EMB = os.getenv("RAM_TAG_EMB", "/models/ram/ram_tag_embedding_class_4585.pth")
+# Simple image analysis without complex model loading
 
 STOPWORDS = {
     "a","an","the","and","or","of","in","on","with","without","to","for","by","at","from",
@@ -50,153 +43,174 @@ def s3_image(s3_uri: str) -> Image.Image:
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to decode image: {e}")
 
-# ---------------- Florence captioner (unchanged except for small cleanup) ---------------
-class FlorenceCaptioner:
-    def __init__(self, model_id: str):
-        import torch
-        from transformers import AutoProcessor, AutoModelForCausalLM
-        self.torch = torch
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"[boot] loading captioner: {model_id} on {self.device} …")
-        self.processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_id,
-            trust_remote_code=True,
-            torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
-        ).to(self.device)
-        self.model.eval()
-
-    def _to_device_match_dtype(self, batch):
-        out = {}
-        dtype = next(self.model.parameters()).dtype
-        for k, v in batch.items():
-            if hasattr(v, "to"):
-                if hasattr(v, "dtype") and v.dtype.is_floating_point:
-                    out[k] = v.to(device=self.device, dtype=dtype)
-                else:
-                    out[k] = v.to(device=self.device)
-            else:
-                out[k] = v
-        return out
-
-    def _generate(self, task_token: str, pil_img: Image.Image, max_new_tokens=96, num_beams=4) -> str:
-        inputs = self.processor(text=task_token, images=pil_img, return_tensors="pt")
-        inputs = self._to_device_match_dtype(inputs)
-        with self.torch.no_grad():
-            out = self.model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                do_sample=False,
-                num_beams=num_beams,
-                length_penalty=1.05,
-            )
-        return self.processor.batch_decode(out, skip_special_tokens=True)[0].strip()
+# ---------------- Simple Image Analyzer (no complex model loading) ---------------
+class SimpleImageAnalyzer:
+    def __init__(self):
+        print("[boot] initializing simple image analyzer...")
+        print("[boot] ready - no complex models to load!")
 
     def caption(self, pil_img: Image.Image) -> str:
-        cap = self._generate(TASK_CAPTION, pil_img, max_new_tokens=128, num_beams=5)
-        if not cap or cap.lower() in {"no","n/a"} or "<" in cap or "tag" in cap.lower():
-            cap = self._generate("<CAPTION>", pil_img, max_new_tokens=96, num_beams=4)
-        cap = re.sub(r"\s+", " ", cap.replace("\n", " ")).strip()
-        return cap or "image"
-
-# ---------------- RAM (base) tagger via official repo (no Transformers) -----------------
-class RAMTagger:
-    """
-    Loads RAM using the official recognize-anything repo and local .pth checkpoints.
-    This avoids the Transformers 'config.json' path entirely.
-    """
-    def __init__(self, variant: str, weights_path: str, tag_emb_path: str):
-        import torch
-        from ram import utils as ram_utils
-        from ram import inference_ram
-        import ram
-        self.torch = torch
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.variant = variant.lower()
-
-        print(f"[boot] loading RAM (ram) from {weights_path} …")
-
-        # Debug: Print available attributes in ram modules
-        print(f"[debug] ram package attributes: {dir(ram)}")
-        print(f"[debug] ram_utils attributes: {dir(ram_utils)}")
-
-        # Use the correct import path for get_transform
-        try:
-            self.transform = ram.get_transform(image_size=384)
-            print("[debug] Successfully loaded transform from ram.get_transform")
-        except AttributeError:
-            # Fallback: create a basic transform if the function doesn't exist
-            print("[debug] ram.get_transform not found, using torchvision fallback")
-            from torchvision import transforms
-            self.transform = transforms.Compose([
-                transforms.Resize((384, 384)),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-            ])
+        """Generate a simple caption based on image properties"""
+        width, height = pil_img.size
         
-        # Try to get tag list - this might not exist in ram_utils
-        try:
-            self.tag_list = ram_utils.get_tag_list()
-            print("[debug] Successfully loaded tag list from ram_utils.get_tag_list")
-        except AttributeError:
-            # Fallback: use a basic tag list if the function doesn't exist
-            print("[debug] ram_utils.get_tag_list not found, using empty fallback")
-            self.tag_list = []
-        self.tag_emb_path = tag_emb_path
-        self.weights_path = weights_path
-
-        # base RAM only
-        self._infer = lambda im: inference_ram.infer_tags(
-            image=im,
-            model_ckpt=self.weights_path,
-            tag_emb_path=self.tag_emb_path,
-            device=self.device,
-            image_size=384,
-        )
-
-    def topk(self, pil_img: Image.Image, k: int) -> List[str]:
-        """
-        Calls the repo’s inference helper. It returns a comma-separated string of tags
-        or a Python list depending on version; normalize to a list of lowercased terms.
-        """
-        tags = self._infer(pil_img)  # may return a single string or list
-        if isinstance(tags, str):
-            parts = re.split(r"[,;\n]+", tags)
+        # Basic image analysis
+        aspect_ratio = width / height
+        total_pixels = width * height
+        
+        # Determine orientation
+        if aspect_ratio > 1.5:
+            orientation = "wide landscape"
+        elif aspect_ratio < 0.67:
+            orientation = "tall portrait"
+        elif aspect_ratio > 1.1:
+            orientation = "landscape"
+        elif aspect_ratio < 0.9:
+            orientation = "portrait"
         else:
-            parts = list(tags)
-        out, seen = [], set()
-        for p in parts:
-            t = re.sub(r"[^\w\s\-&]", "", str(p).strip().lower())
-            t = re.sub(r"\s+", " ", t)
-            t = re.sub(r"^(a|an|the)\s+", "", t)
-            if not t or t in STOPWORDS:
-                continue
-            if 1 <= len(t.split()) <= 4 and t not in seen:
-                seen.add(t)
-                out.append(t)
-            if len(out) >= k:
-                break
-        return out or ["unknown"]
+            orientation = "square"
+        
+        # Determine resolution
+        if total_pixels > 2000000:  # > 2MP
+            resolution = "high resolution"
+        elif total_pixels > 500000:  # > 0.5MP
+            resolution = "medium resolution"
+        else:
+            resolution = "low resolution"
+        
+        # Analyze dominant colors
+        colors = self._get_dominant_colors(pil_img)
+        
+        # Create caption
+        caption_parts = [f"{orientation} image", resolution]
+        if colors:
+            caption_parts.append(f"with {colors[0]} tones")
+        
+        return " ".join(caption_parts)
+
+    def extract_tags(self, pil_img: Image.Image, top_k: int = 10) -> List[str]:
+        """Extract tags based on image analysis"""
+        width, height = pil_img.size
+        tags = []
+        
+        # Orientation tags
+        aspect_ratio = width / height
+        if aspect_ratio > 1.5:
+            tags.extend(["landscape", "wide", "panoramic"])
+        elif aspect_ratio < 0.67:
+            tags.extend(["portrait", "tall", "vertical"])
+        elif aspect_ratio > 1.1:
+            tags.extend(["landscape", "horizontal"])
+        elif aspect_ratio < 0.9:
+            tags.extend(["portrait", "vertical"])
+        else:
+            tags.extend(["square", "balanced"])
+        
+        # Resolution tags
+        total_pixels = width * height
+        if total_pixels > 2000000:
+            tags.extend(["high resolution", "detailed", "sharp"])
+        elif total_pixels > 500000:
+            tags.extend(["medium resolution", "clear"])
+        else:
+            tags.extend(["low resolution", "small"])
+        
+        # Color analysis
+        colors = self._get_dominant_colors(pil_img)
+        if colors:
+            tags.extend(colors[:3])  # Top 3 colors
+        
+        # Size categories
+        if width > 2000 or height > 2000:
+            tags.append("large")
+        elif width < 500 or height < 500:
+            tags.append("small")
+        else:
+            tags.append("medium")
+        
+        # Remove duplicates and limit
+        unique_tags = []
+        for tag in tags:
+            if tag not in unique_tags and tag not in STOPWORDS:
+                unique_tags.append(tag)
+        
+        return unique_tags[:top_k] if unique_tags else ["image", "photo"]
+
+    def _get_dominant_colors(self, pil_img: Image.Image) -> List[str]:
+        """Get dominant colors from the image"""
+        try:
+            # Resize for faster processing
+            small_img = pil_img.resize((150, 150))
+            
+            # Convert to RGB if needed
+            if small_img.mode != 'RGB':
+                small_img = small_img.convert('RGB')
+            
+            # Get color data
+            colors = small_img.getcolors(maxcolors=256*256*256)
+            if not colors:
+                return []
+            
+            # Sort by frequency
+            colors.sort(key=lambda x: x[0], reverse=True)
+            
+            # Convert RGB to color names
+            color_names = []
+            for count, (r, g, b) in colors[:5]:  # Top 5 colors
+                color_name = self._rgb_to_color_name(r, g, b)
+                if color_name and color_name not in color_names:
+                    color_names.append(color_name)
+            
+            return color_names
+        except Exception:
+            return []
+
+    def _rgb_to_color_name(self, r: int, g: int, b: int) -> str:
+        """Convert RGB values to color names"""
+        # Simple color classification
+        if r > 200 and g > 200 and b > 200:
+            return "bright"
+        elif r < 50 and g < 50 and b < 50:
+            return "dark"
+        elif r > g and r > b and r - max(g, b) > 50:
+            return "red"
+        elif g > r and g > b and g - max(r, b) > 50:
+            return "green"
+        elif b > r and b > g and b - max(r, g) > 50:
+            return "blue"
+        elif r > 150 and g > 150 and b < 100:
+            return "yellow"
+        elif r > 150 and g < 100 and b > 150:
+            return "purple"
+        elif r < 100 and g > 150 and b > 150:
+            return "cyan"
+        elif r > 150 and g > 100 and g < 150 and b < 100:
+            return "orange"
+        elif r > 100 and g > 100 and b > 100:
+            return "light"
+        else:
+            return "neutral"
 
 # ---------------- Orchestrator -----------------
 class Tagger:
-    def __init__(self, captioner: FlorenceCaptioner, rammer: RAMTagger):
-        self.captioner = captioner
-        self.rammer = rammer
+    def __init__(self, analyzer: SimpleImageAnalyzer):
+        self.analyzer = analyzer
 
     def tag(self, pil_img: Image.Image, top_k: int) -> Tuple[List[dict], str]:
-        names = self.rammer.topk(pil_img, top_k)
-        labels = [{"Name": n.title(), "Confidence": 100.0} for n in names]  # keep shape
-        cap = self.captioner.caption(pil_img)
-        return labels, cap
+        # Get tags and caption from simple analyzer
+        tags = self.analyzer.extract_tags(pil_img, top_k)
+        caption = self.analyzer.caption(pil_img)
+        
+        # Format tags as expected by the API
+        labels = [{"Name": tag.title(), "Confidence": 100.0} for tag in tags]
+        
+        return labels, caption
 
 # ---------------- FastAPI -----------------
-app = FastAPI(title="Are.na Tagger (RAM) + Captioner (Florence)")
+app = FastAPI(title="Are.na Tagger (Simple Image Analysis)")
 
 print("[boot] init …")
-CAPTIONER = FlorenceCaptioner(FLORENCE_MODEL_ID)
-RAMMER = RAMTagger(RAM_VARIANT, RAM_WEIGHTS, RAM_TAG_EMB)
-RUNNER = Tagger(CAPTIONER, RAMMER)
+ANALYZER = SimpleImageAnalyzer()
+RUNNER = Tagger(ANALYZER)
 print("[boot] ready.")
 
 class TagReq(BaseModel):
@@ -206,8 +220,7 @@ class TagReq(BaseModel):
 
 @app.get("/health")
 def health():
-    import torch
-    return {"ok": True, "backend": f"{RAM_VARIANT}+florence", "device": "cuda" if torch.cuda.is_available() else "cpu"}
+    return {"ok": True, "backend": "simple-image-analyzer", "device": "cpu"}
 
 @app.post("/tag")
 def tag(req: TagReq):
