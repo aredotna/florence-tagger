@@ -10,20 +10,33 @@ from botocore.exceptions import ClientError
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
+# -------------------------------
+# Config
+# -------------------------------
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 TOP_K_DEFAULT = int(os.getenv("TOP_K", "10"))
-FLORENCE_MODEL_ID = os.getenv("FLORENCE_MODEL_ID", "microsoft/Florence-2-large-ft")  # instruction-tuned
+FLORENCE_MODEL_ID = os.getenv("FLORENCE_MODEL_ID", "microsoft/Florence-2-large-ft")
+SIGLIP_MODEL_ID = os.getenv("SIGLIP_MODEL_ID", "google/siglip-so400m-patch14-384")
+ENABLE_OWL = os.getenv("ENABLE_OWL", "false").lower() in {"1", "true", "yes"}
 
-# Florence task tokens (no prose!)
-TASK_CAPTION = "<DETAILED_CAPTION>"  # try "<CAPTION>" if you prefer shorter lines
-TASK_TAGS    = "<TAGS>"
+# Florence task tokens (caption only)
+TASK_CAPTION = "<DETAILED_CAPTION>"  # or "<CAPTION>" for shorter
 
 STOPWORDS = {
     "a","an","the","and","or","of","in","on","with","without","to","for","by","at","from",
     "that","this","me","photo","image","picture","set","answering","unanswerable","text",
-    "no extra text", "n/a", "none"
+    "no extra text","n/a","none","tag","tags","we can see","in this image"
 }
 
+# Common art/media terms we DO allow as tags if they show up
+KEEP_STYLE = {
+    "woodcut","engraving","etching","lithograph","collage","ink drawing","cyanotype",
+    "screen print","printmaking","oil painting","watercolor","charcoal","pencil drawing"
+}
+
+# -------------------------------
+# S3 fetcher
+# -------------------------------
 def s3_image(s3_uri: str) -> Image.Image:
     if not s3_uri.startswith("s3://"):
         raise HTTPException(status_code=400, detail="s3_uri must start with s3://")
@@ -32,7 +45,6 @@ def s3_image(s3_uri: str) -> Image.Image:
         bucket, key = path.split("/", 1)
     except ValueError:
         raise HTTPException(status_code=400, detail="invalid s3_uri (missing key)")
-    # If you hit region errors, remove region_name to let boto resolve automatically
     s3 = boto3.client("s3", region_name=AWS_REGION, config=Config(signature_version="s3v4"))
     try:
         obj = s3.get_object(Bucket=bucket, Key=key)
@@ -45,16 +57,18 @@ def s3_image(s3_uri: str) -> Image.Image:
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to decode image: {e}")
 
-class FlorenceRunner:
+# -------------------------------
+# Florence (caption only)
+# -------------------------------
+class FlorenceCaptioner:
     def __init__(self, model_id: str):
         import torch
         from transformers import AutoProcessor, AutoModelForCausalLM
 
         self.torch = torch
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"[boot] loading {model_id} on {self.device} …")
+        print(f"[boot] loading captioner: {model_id} on {self.device} …")
 
-        # processor/model with remote code (Florence needs this)
         self.processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
         self.model = AutoModelForCausalLM.from_pretrained(
             model_id,
@@ -62,7 +76,6 @@ class FlorenceRunner:
             trust_remote_code=True
         ).to(self.device)
 
-        # perf knobs (harmless if CPU)
         try:
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
@@ -70,11 +83,9 @@ class FlorenceRunner:
             pass
 
     def _generate(self, task_token: str, pil_img: Image.Image, max_new_tokens=96, num_beams=4) -> str:
-        # IMPORTANT: pass the task token as the *text* (no examples/prose)
         inputs = self.processor(text=task_token, images=pil_img, return_tensors="pt")
         dtype = getattr(self.model, "dtype", None)
 
-        # ensure device + dtype match model (fixes float vs half)
         casted = {}
         for k, v in inputs.items():
             if hasattr(v, "to"):
@@ -89,77 +100,174 @@ class FlorenceRunner:
             out = self.model.generate(
                 **casted,
                 max_new_tokens=max_new_tokens,
-                do_sample=False,        # deterministic
-                num_beams=num_beams,    # a bit more thorough
+                do_sample=False,
+                num_beams=num_beams,
                 length_penalty=1.05,
+                no_repeat_ngram_size=3,
             )
         return self.processor.batch_decode(out, skip_special_tokens=True)[0].strip()
 
     def caption(self, pil_img: Image.Image) -> str:
         cap = self._generate(TASK_CAPTION, pil_img, max_new_tokens=128, num_beams=5)
-        # guard against weird echoes
         if not cap or cap.lower() in {"no","n/a"} or "<" in cap or "tag" in cap.lower():
             cap = self._generate("<CAPTION>", pil_img, max_new_tokens=96, num_beams=4)
-        return cap.replace("\n", " ").strip()
+        # tighten to a single tidy sentence if model rambles
+        cap = cap.replace("\n", " ").strip()
+        cap = re.sub(r"\s+", " ", cap)
+        # drop the "in this image we can see" boilerplate if present
+        cap = re.sub(r"(?i)\b(in this image|we can see|this is)\b[^.]*\.?\s*", "", cap).strip()
+        return cap or "image"
 
-    def tag_text(self, pil_img: Image.Image) -> str:
-        txt = self._generate(TASK_TAGS, pil_img, max_new_tokens=64, num_beams=4)
-        # guard against invalid output (echoed instructions)
-        if "<" in txt or "example" in txt.lower() or len(txt) < 3:
-            txt = self._generate("<TAGS>", pil_img, max_new_tokens=48, num_beams=4)
-        return txt.strip()
+# -------------------------------
+# SigLIP scorer (image-text cosine)
+# -------------------------------
+class SiglipScorer:
+    def __init__(self, model_id: str):
+        import torch
+        from transformers import AutoProcessor, AutoModel
+        self.torch = torch
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"[boot] loading SigLIP: {model_id} on {self.device} …")
+        self.processor = AutoProcessor.from_pretrained(model_id)
+        self.model = AutoModel.from_pretrained(
+            model_id,
+            torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
+        ).to(self.device)
+        self.model.eval()
 
-    # cleaning helpers
-    def clean_tags(self, tag_str: str) -> List[str]:
-        # Split on commas and semicolons, also handle newlines
-        raw = re.split(r"[,;\n]+", tag_str)
-        cleaned, seen = [], set()
-        for t in raw:
-            t = t.strip().lower()
-            t = "".join(ch for ch in t if ch.isalnum() or ch == " ").strip()
-            if not t or t in STOPWORDS:
+    def image_emb(self, pil_img: Image.Image):
+        with self.torch.no_grad():
+            inputs = self.processor(images=pil_img, return_tensors="pt").to(self.device)
+            out = self.model.get_image_features(**inputs)
+            emb = out / (out.norm(dim=-1, keepdim=True) + 1e-8)
+            return emb  # [1, d]
+
+    def text_emb(self, texts: List[str]):
+        with self.torch.no_grad():
+            inputs = self.processor(text=texts, return_tensors="pt", padding=True, truncation=True).to(self.device)
+            out = self.model.get_text_features(**inputs)
+            emb = out / (out.norm(dim=-1, keepdim=True) + 1e-8)
+            return emb  # [n, d]
+
+    def rank(self, pil_img: Image.Image, candidates: List[str]) -> List[Tuple[str, float]]:
+        if not candidates:
+            return []
+        img_e = self.image_emb(pil_img)         # [1, d]
+        txt_e = self.text_emb(candidates)        # [n, d]
+        # cosine since they are L2-normalized
+        sims = (img_e @ txt_e.T).squeeze(0)      # [n]
+        vals = sims.detach().float().cpu().tolist()
+        # pair and sort desc
+        paired = list(zip(candidates, vals))
+        paired.sort(key=lambda x: x[1], reverse=True)
+        return paired
+
+# -------------------------------
+# Candidate extraction
+# -------------------------------
+def candidate_tags_from_caption(caption: str) -> List[str]:
+    """
+    Very light noun-ish extraction from a caption to ensure we never return empty tags.
+    """
+    cap = caption.lower()
+    # split on commas/colons/dashes/periods
+    parts = re.split(r"[,\.:;—\-]+", cap)
+    cands = []
+    for p in parts:
+        t = re.sub(r"[^\w\s\-&]", "", p).strip()
+        if not t:
+            continue
+        # keep short noun-y phrases (1..4 tokens)
+        toks = t.split()
+        if 1 <= len(toks) <= 4:
+            # drop boilerplate
+            if any(sw in t for sw in STOPWORDS):
                 continue
-            # drop overly generic meta words
-            if t in {"photo", "image", "picture", "tag", "tags"}:
-                continue
-            # short phrases only
-            if 1 <= len(t.split()) <= 4 and t not in seen:
-                seen.add(t)
-                cleaned.append(t)
-        return cleaned
+            cands.append(t)
+    # allow style/media keeps
+    for k in KEEP_STYLE:
+        if k in cap and k not in cands:
+            cands.append(k)
+    # normalize/pad some common useful tokens
+    cap_norm = " " + cap + " "
+    if "black and white" in cap_norm and "black and white" not in cands:
+        cands.append("black and white")
+    return dedupe_keep_order([normalize_tag(x) for x in cands])
 
-    def labels_from_candidates(self, cands: List[str], top_k: int) -> List[dict]:
-        # simple descending confidence by rank; you can swap for CLIP re-rank later
-        labels = []
-        for i, term in enumerate(cands[:top_k]):
-            conf = max(55.0, 100.0 - i * (45.0 / max(1, top_k - 1)))
-            labels.append({"Name": term.title(), "Confidence": round(conf, 1)})
-        return labels
+def normalize_tag(t: str) -> str:
+    t = t.strip().lower()
+    t = re.sub(r"\s+", " ", t)
+    t = re.sub(r"^(a|an|the)\s+", "", t)
+    # drop too generic single words
+    if t in {"image","photo","picture","painting","art","graphic","illustration","scene","view"}:
+        return ""
+    return t
+
+def dedupe_keep_order(seq: List[str]) -> List[str]:
+    seen, out = set(), []
+    for s in seq:
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+def sanitize_topk(cands: List[str], top_k: int) -> List[str]:
+    out = []
+    for c in cands:
+        c2 = re.sub(r"[^\w\s\-&]", "", c).strip()
+        if not c2 or c2 in STOPWORDS:
+            continue
+        # keep only short phrases
+        if 1 <= len(c2.split()) <= 4:
+            out.append(c2)
+        if len(out) >= top_k * 2:  # keep a small buffer before final cut
+            break
+    return dedupe_keep_order(out)
+
+# -------------------------------
+# Tagging orchestrator
+# -------------------------------
+class Tagger:
+    def __init__(self, captioner: FlorenceCaptioner, scorer: SiglipScorer):
+        self.captioner = captioner
+        self.scorer = scorer
 
     def tag(self, pil_img: Image.Image, top_k: int) -> Tuple[List[dict], str]:
-        tag_str = self.tag_text(pil_img)
-        cap = self.caption(pil_img)
-        cands = self.clean_tags(tag_str)
+        # 1) caption
+        cap = self.captioner.caption(pil_img)
 
-        # Backstop: harvest a few nounish bits from caption if Florence tags were thin
-        if len(cands) < max(3, top_k // 2):
-            extras = []
-            # very light noun-ish extraction from caption
-            for piece in re.split(r"[,:;—\-]+", cap.lower()):
-                t = "".join(ch for ch in piece if ch.isalnum() or ch == " ").strip()
-                if t and 1 <= len(t.split()) <= 3 and t not in STOPWORDS:
-                    extras.append(t)
-            # de-dup
-            for e in extras:
-                if e not in cands:
-                    cands.append(e)
+        # 2) build candidate tags from caption
+        cands = candidate_tags_from_caption(cap)
 
-        return self.labels_from_candidates(cands, top_k), cap
+        # 3) (optional) OWL proposals could be added here and unioned
+        # if ENABLE_OWL:
+        #     cands = union_with_owl_proposals(pil_img, cands)
 
-app = FastAPI(title="Florence Keyword Tagger (task tokens)")
+        # 4) sanitize and ensure we have something
+        cands = sanitize_topk(cands, max(top_k * 3, 20))
+        if not cands:
+            cands = ["portrait","person","indoor","black and white"]  # last-resort fallbacks
+
+        # 5) rank with SigLIP image-text similarity
+        ranked = self.scorer.rank(pil_img, cands)
+
+        # 6) final top_k
+        top = [name for (name, _score) in ranked[:top_k]]
+
+        # Rekognition-style output (you said you don't need confidences; we leave them in for compatibility)
+        labels = [{"Name": t.title(), "Confidence": 100.0} for t in top]
+        return labels, cap
+
+# -------------------------------
+# FastAPI
+# -------------------------------
+app = FastAPI(title="Are.na Image Caption+Tags (Florence+SigLIP)")
 
 print("[boot] init …")
-RUNNER = FlorenceRunner(FLORENCE_MODEL_ID)
+CAPTIONER = FlorenceCaptioner(FLORENCE_MODEL_ID)
+SCORER = SiglipScorer(SIGLIP_MODEL_ID)
+RUNNER = Tagger(CAPTIONER, SCORER)
 print("[boot] ready.")
 
 class TagReq(BaseModel):
@@ -170,7 +278,11 @@ class TagReq(BaseModel):
 @app.get("/health")
 def health():
     import torch
-    return {"ok": True, "backend": "florence-ft", "device": "cuda" if torch.cuda.is_available() else "cpu"}
+    return {
+        "ok": True,
+        "backend": "florence+siglip",
+        "device": "cuda" if torch.cuda.is_available() else "cpu"
+    }
 
 @app.post("/tag")
 def tag(req: TagReq):
