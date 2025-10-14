@@ -17,6 +17,10 @@ COPY requirements.txt ./
 RUN pip install --upgrade pip setuptools wheel && \
     pip install --no-cache-dir -r requirements.txt
 
+# OPTIONAL earlier — now REQUIRED by Florence remote code:
+ENV TORCH_CUDA_ARCH_LIST="8.6" CMAKE_ARGS="-DCMAKE_CUDA_ARCHITECTURES=86" MAX_JOBS=4
+RUN pip install --no-cache-dir --no-build-isolation "flash-attn==2.5.6"
+  
 # App
 COPY app.py ./
 
