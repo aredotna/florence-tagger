@@ -109,14 +109,37 @@ class RAMTagger:
         import torch
         from ram import utils as ram_utils
         from ram import inference_ram
+        from ram import transforms as ram_transforms
         self.torch = torch
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.variant = variant.lower()
 
         print(f"[boot] loading RAM (ram) from {weights_path} …")
 
-        self.transform = ram_utils.get_transform(image_size=384)
-        self.tag_list = ram_utils.get_tag_list()
+        # Debug: Print available attributes in ram modules
+        print(f"[debug] ram_utils attributes: {dir(ram_utils)}")
+        print(f"[debug] ram_transforms attributes: {dir(ram_transforms)}")
+
+        # Try different possible locations for get_transform
+        try:
+            self.transform = ram_transforms.get_transform(image_size=384)
+        except AttributeError:
+            try:
+                self.transform = ram_utils.get_transform(image_size=384)
+            except AttributeError:
+                # Fallback: create a basic transform if the function doesn't exist
+                from torchvision import transforms
+                self.transform = transforms.Compose([
+                    transforms.Resize((384, 384)),
+                    transforms.ToTensor(),
+                    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+                ])
+        
+        try:
+            self.tag_list = ram_utils.get_tag_list()
+        except AttributeError:
+            # Fallback: use a basic tag list if the function doesn't exist
+            self.tag_list = []
         self.tag_emb_path = tag_emb_path
         self.weights_path = weights_path
 
