@@ -65,10 +65,12 @@ class BLIPCaptioner:
             with torch.no_grad():
                 generated_ids = self.model.generate(
                     **inputs,
-                    max_length=50,
-                    num_beams=4,
-                    temperature=0.7,
+                    max_length=100,
+                    num_beams=6,
+                    temperature=0.8,
                     do_sample=True,
+                    early_stopping=True,
+                    repetition_penalty=1.2,
                 )
             
             # Decode caption
