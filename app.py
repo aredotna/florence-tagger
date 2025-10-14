@@ -51,33 +51,84 @@ class BLIPCaptioner:
             raise e
 
     def caption(self, pil_img: Image.Image) -> str:
-        """Generate a caption for the image"""
+        """Generate a detailed caption for the image"""
         try:
             import torch
             
-            # Process image
+            # Try multiple prompts to get a longer description
+            prompts = [
+                "Describe this image in detail:",
+                "What do you see in this image?",
+                "Describe the scene:"
+            ]
+            
+            all_captions = []
+            
+            for prompt in prompts:
+                try:
+                    # Process image with text prompt
+                    inputs = self.processor(images=pil_img, text=prompt, return_tensors="pt")
+                    
+                    if self.device == "cuda":
+                        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+                    
+                    # Generate caption
+                    with torch.no_grad():
+                        generated_ids = self.model.generate(
+                            **inputs,
+                            max_length=80,
+                            num_beams=4,
+                            temperature=0.7,
+                            do_sample=True,
+                            early_stopping=True,
+                        )
+                    
+                    # Decode caption
+                    caption = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+                    
+                    # Clean up caption
+                    caption = caption.strip()
+                    if caption and caption.lower() not in ["", "image", "photo"]:
+                        # Remove the prompt from the response
+                        for p in prompts:
+                            caption = caption.replace(p.lower(), "").strip()
+                        all_captions.append(caption)
+                        
+                except Exception as e:
+                    print(f"[error] Prompt '{prompt}' failed: {e}")
+                    continue
+            
+            # If we got multiple captions, combine them
+            if all_captions:
+                # Remove duplicates and combine
+                unique_captions = []
+                for cap in all_captions:
+                    if cap not in unique_captions and len(cap) > 10:
+                        unique_captions.append(cap)
+                
+                if unique_captions:
+                    # Combine the best captions
+                    combined = ". ".join(unique_captions[:2])  # Take up to 2 best captions
+                    return combined
+            
+            # Fallback: try without prompt
             inputs = self.processor(images=pil_img, return_tensors="pt")
             
             if self.device == "cuda":
                 inputs = {k: v.to(self.device) for k, v in inputs.items()}
             
-            # Generate caption
             with torch.no_grad():
                 generated_ids = self.model.generate(
                     **inputs,
-                    max_length=100,
-                    num_beams=6,
-                    temperature=0.8,
+                    max_length=60,
+                    num_beams=4,
+                    temperature=0.7,
                     do_sample=True,
-                    early_stopping=True,
-                    repetition_penalty=1.2,
                 )
             
-            # Decode caption
             caption = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
-            
-            # Clean up caption
             caption = caption.strip()
+            
             if not caption or caption.lower() in ["", "image", "photo"]:
                 return "an image"
             
