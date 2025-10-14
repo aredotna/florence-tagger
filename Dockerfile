@@ -14,6 +14,12 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Add OpenAI CLIP + its tokenizer deps
+RUN pip install --no-cache-dir \
+    "git+https://github.com/openai/CLIP.git" \
+    ftfy==6.2.0 \
+    regex==2024.7.24
+
 # Install the official RAM code (gives us the ram.* modules and inference helpers)
 RUN pip install --no-cache-dir git+https://github.com/xinyu1205/recognize-anything.git
 
