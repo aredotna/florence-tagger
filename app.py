@@ -23,71 +23,114 @@ def s3_image(s3_uri: str) -> Image.Image:
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to decode image: {e}")
 
-# ---------------- InstructBLIP Captioner ---------------
+# ---------------- Enhanced BLIP Captioner ---------------
 class BLIPCaptioner:
     def __init__(self):
-        print("[boot] Loading InstructBLIP model...")
+        print("[boot] Loading Enhanced BLIP model...")
         
         try:
-            from transformers import InstructBlipProcessor, InstructBlipForConditionalGeneration
+            from transformers import BlipProcessor, BlipForConditionalGeneration
             import torch
             
             self.device = "cuda" if torch.cuda.is_available() else "cpu"
             print(f"[boot] Using device: {self.device}")
             
-            # Use InstructBLIP for excellent captions (much more stable than BLIP-2)
-            model_name = "Salesforce/instructblip-vicuna-7b"
+            # Use the reliable BLIP model with better parameters
+            model_name = "Salesforce/blip-image-captioning-large"
             
-            self.processor = InstructBlipProcessor.from_pretrained(model_name)
-            self.model = InstructBlipForConditionalGeneration.from_pretrained(model_name)
+            self.processor = BlipProcessor.from_pretrained(model_name)
+            self.model = BlipForConditionalGeneration.from_pretrained(model_name)
             
             if self.device == "cuda":
                 self.model = self.model.to(self.device)
             
-            print("[boot] InstructBLIP model loaded successfully!")
+            print("[boot] Enhanced BLIP model loaded successfully!")
             
         except Exception as e:
-            print(f"[boot] Error loading InstructBLIP: {e}")
+            print(f"[boot] Error loading Enhanced BLIP: {e}")
             raise e
 
     def caption(self, pil_img: Image.Image) -> str:
-        """Generate a detailed caption for the image using InstructBLIP"""
+        """Generate a detailed caption using multiple prompts with BLIP"""
         try:
             import torch
             
-            # InstructBLIP excels at following detailed prompts
-            prompt = "Describe this image in detail, including the setting, objects, people, and any notable features:"
+            # Try multiple prompts to get the best description
+            prompts = [
+                "Describe this image in detail:",
+                "What do you see in this image?",
+                "Describe the scene:",
+                "What is happening in this image?",
+                "Describe the setting and objects:"
+            ]
             
-            inputs = self.processor(images=pil_img, text=prompt, return_tensors="pt")
+            best_caption = ""
+            max_length = 0
             
-            if self.device == "cuda":
-                inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            for prompt in prompts:
+                try:
+                    inputs = self.processor(images=pil_img, text=prompt, return_tensors="pt")
+                    
+                    if self.device == "cuda":
+                        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+                    
+                    # Generate caption with optimized parameters
+                    with torch.no_grad():
+                        generated_ids = self.model.generate(
+                            **inputs,
+                            max_length=80,  # Longer captions
+                            num_beams=5,     # High quality
+                            temperature=0.7, # Balanced creativity
+                            do_sample=True,   # Allow variety
+                            early_stopping=True,
+                            repetition_penalty=1.1,
+                        )
+                    
+                    # Decode caption
+                    caption = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+                    
+                    # Clean up caption - remove the prompt if it appears
+                    if prompt.lower() in caption.lower():
+                        caption = caption.replace(prompt, "").strip()
+                    
+                    # Choose the longest, most detailed caption
+                    if len(caption) > max_length and caption.strip():
+                        best_caption = caption
+                        max_length = len(caption)
+                        
+                except Exception as e:
+                    print(f"[warning] Prompt '{prompt}' failed: {e}")
+                    continue
             
-            # Generate caption with optimized parameters for detailed descriptions
-            with torch.no_grad():
-                generated_ids = self.model.generate(
-                    **inputs,
-                    max_length=150,  # Even longer captions
-                    num_beams=5,      # High quality
-                    temperature=0.7,  # Balanced creativity
-                    do_sample=True,   # Allow variety
-                    early_stopping=True,
-                    repetition_penalty=1.1,
-                )
+            # If no prompts worked, try without prompt
+            if not best_caption:
+                try:
+                    inputs = self.processor(images=pil_img, return_tensors="pt")
+                    
+                    if self.device == "cuda":
+                        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+                    
+                    with torch.no_grad():
+                        generated_ids = self.model.generate(
+                            **inputs,
+                            max_length=60,
+                            num_beams=4,
+                            temperature=0.6,
+                            do_sample=False,
+                            early_stopping=True,
+                        )
+                    
+                    best_caption = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+                    
+                except Exception as e:
+                    print(f"[warning] Fallback generation failed: {e}")
             
-            # Decode caption
-            caption = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
-            
-            # Clean up caption - remove the prompt if it appears
-            if prompt.lower() in caption.lower():
-                caption = caption.replace(prompt, "").strip()
-            
-            # Clean up any remaining artifacts
-            caption = caption.strip()
-            if not caption or caption.lower() in ["", "image", "photo", "picture"]:
+            # Final cleanup
+            best_caption = best_caption.strip()
+            if not best_caption or best_caption.lower() in ["", "image", "photo", "picture"]:
                 return "an image"
             
-            return caption
+            return best_caption
             
         except Exception as e:
             print(f"[error] Caption generation failed: {e}")
@@ -105,7 +148,7 @@ class CaptionRequest(BaseModel):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "instructblip-captioner"}
+    return {"status": "ok", "service": "enhanced-blip-captioner"}
 
 @app.post("/caption")
 def caption_image(req: CaptionRequest):
