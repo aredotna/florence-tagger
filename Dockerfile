@@ -1,9 +1,12 @@
-# PyTorch base image for CLIP
-FROM pytorch/pytorch:2.1.0-cuda11.8-cudnn8-devel
+# Minimal Python base image
+FROM python:3.10-slim
 
-RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
+# Install only essential system dependencies
+RUN apt-get update && apt-get install -y \
+    git \
+    && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --upgrade pip setuptools wheel
+RUN pip install --upgrade pip
 
 WORKDIR /app
 COPY requirements.txt .

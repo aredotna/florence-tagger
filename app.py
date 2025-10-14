@@ -83,11 +83,11 @@ class BLIPTagger:
         try:
             # Generate multiple captions with different prompts to get diverse tags
             prompts = [
-                "Describe this image in detail:",
-                "What objects are in this image?",
-                "What is happening in this image?",
-                "List the main subjects in this image:",
-                "What can you see in this image?"
+                "What is in this image?",
+                "Describe the scene:",
+                "What objects do you see?",
+                "What is happening here?",
+                "List the key elements:"
             ]
             
             all_tags = []
@@ -134,7 +134,7 @@ class BLIPTagger:
         # Clean up the text
         text = text.lower().strip()
         
-        # Remove common prefixes
+        # Remove common prefixes and prompts
         prefixes_to_remove = [
             "describe this image in detail:",
             "what objects are in this image?",
@@ -149,6 +149,16 @@ class BLIPTagger:
             "there is a",
             "there is an",
             "there are",
+            "describe",
+            "detail",
+            "list",
+            "main",
+            "subjects",
+            "what",
+            "objects",
+            "happening",
+            "can",
+            "see",
         ]
         
         for prefix in prefixes_to_remove:
@@ -158,10 +168,17 @@ class BLIPTagger:
         # Split into words and clean them
         words = re.findall(r'\b[a-zA-Z]{3,}\b', text)
         
+        # Enhanced stopwords list
+        enhanced_stopwords = STOPWORDS.union({
+            "image", "photo", "picture", "shows", "contains", "there", "this", "that",
+            "describe", "detail", "list", "main", "subjects", "what", "objects", 
+            "happening", "can", "see", "old", "new", "large", "small", "big", "little"
+        })
+        
         # Filter out common words and keep meaningful ones
         meaningful_words = []
         for word in words:
-            if (word not in STOPWORDS and 
+            if (word not in enhanced_stopwords and 
                 len(word) > 2 and 
                 word.isalpha() and
                 word not in ["image", "photo", "picture", "shows", "contains", "there"]):
