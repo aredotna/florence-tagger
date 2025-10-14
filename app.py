@@ -109,7 +109,7 @@ class RAMTagger:
         import torch
         from ram import utils as ram_utils
         from ram import inference_ram
-        from ram import transforms as ram_transforms
+        import ram
         self.torch = torch
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.variant = variant.lower()
@@ -117,28 +117,30 @@ class RAMTagger:
         print(f"[boot] loading RAM (ram) from {weights_path} …")
 
         # Debug: Print available attributes in ram modules
+        print(f"[debug] ram package attributes: {dir(ram)}")
         print(f"[debug] ram_utils attributes: {dir(ram_utils)}")
-        print(f"[debug] ram_transforms attributes: {dir(ram_transforms)}")
 
-        # Try different possible locations for get_transform
+        # Use the correct import path for get_transform
         try:
-            self.transform = ram_transforms.get_transform(image_size=384)
+            self.transform = ram.get_transform(image_size=384)
+            print("[debug] Successfully loaded transform from ram.get_transform")
         except AttributeError:
-            try:
-                self.transform = ram_utils.get_transform(image_size=384)
-            except AttributeError:
-                # Fallback: create a basic transform if the function doesn't exist
-                from torchvision import transforms
-                self.transform = transforms.Compose([
-                    transforms.Resize((384, 384)),
-                    transforms.ToTensor(),
-                    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-                ])
+            # Fallback: create a basic transform if the function doesn't exist
+            print("[debug] ram.get_transform not found, using torchvision fallback")
+            from torchvision import transforms
+            self.transform = transforms.Compose([
+                transforms.Resize((384, 384)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            ])
         
+        # Try to get tag list - this might not exist in ram_utils
         try:
             self.tag_list = ram_utils.get_tag_list()
+            print("[debug] Successfully loaded tag list from ram_utils.get_tag_list")
         except AttributeError:
             # Fallback: use a basic tag list if the function doesn't exist
+            print("[debug] ram_utils.get_tag_list not found, using empty fallback")
             self.tag_list = []
         self.tag_emb_path = tag_emb_path
         self.weights_path = weights_path
