@@ -134,17 +134,37 @@ class SiglipScorer:
             torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
         ).to(self.device)
         self.model.eval()
+        # discover the model's parameter dtype (fp16 on GPU)
+        try:
+            self.model_dtype = next(self.model.parameters()).dtype
+        except StopIteration:
+            self.model_dtype = torch.float16 if self.device == "cuda" else torch.float32
+
+    def _to_device_match_dtype(self, batch):
+        """Move to device; cast only floating tensors to the model's dtype."""
+        out = {}
+        for k, v in batch.items():
+            if hasattr(v, "to"):
+                if hasattr(v, "dtype") and v.dtype.is_floating_point:
+                    out[k] = v.to(device=self.device, dtype=self.model_dtype)
+                else:
+                    out[k] = v.to(device=self.device)
+            else:
+                out[k] = v
+        return out
 
     def image_emb(self, pil_img: Image.Image):
         with self.torch.no_grad():
-            inputs = self.processor(images=pil_img, return_tensors="pt").to(self.device)
+            inputs = self.processor(images=pil_img, return_tensors="pt")
+            inputs = self._to_device_match_dtype(inputs)
             out = self.model.get_image_features(**inputs)
             emb = out / (out.norm(dim=-1, keepdim=True) + 1e-8)
             return emb  # [1, d]
 
     def text_emb(self, texts: List[str]):
         with self.torch.no_grad():
-            inputs = self.processor(text=texts, return_tensors="pt", padding=True, truncation=True).to(self.device)
+            inputs = self.processor(text=texts, return_tensors="pt", padding=True, truncation=True)
+            inputs = self._to_device_match_dtype(inputs)  # casts only floating tensors
             out = self.model.get_text_features(**inputs)
             emb = out / (out.norm(dim=-1, keepdim=True) + 1e-8)
             return emb  # [n, d]
@@ -152,12 +172,10 @@ class SiglipScorer:
     def rank(self, pil_img: Image.Image, candidates: List[str]) -> List[Tuple[str, float]]:
         if not candidates:
             return []
-        img_e = self.image_emb(pil_img)         # [1, d]
-        txt_e = self.text_emb(candidates)        # [n, d]
-        # cosine since they are L2-normalized
-        sims = (img_e @ txt_e.T).squeeze(0)      # [n]
+        img_e = self.image_emb(pil_img)
+        txt_e = self.text_emb(candidates)
+        sims = (img_e @ txt_e.T).squeeze(0)      # cosine since both are L2-normalized
         vals = sims.detach().float().cpu().tolist()
-        # pair and sort desc
         paired = list(zip(candidates, vals))
         paired.sort(key=lambda x: x[1], reverse=True)
         return paired
