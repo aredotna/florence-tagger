@@ -226,7 +226,6 @@ class AdvancedCaptioner:
                 **inputs,
                 max_length=60,
                 num_beams=5,
-                temperature=0.6,
                 do_sample=False,
                 early_stopping=True,
                 repetition_penalty=1.1,
