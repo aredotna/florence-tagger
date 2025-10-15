@@ -23,10 +23,10 @@ def s3_image(s3_uri: str) -> Image.Image:
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to decode image: {e}")
 
-# ---------------- Advanced Image Captioner ---------------
-class AdvancedCaptioner:
-    def __init__(self, model_type: str = "blip2"):
-        print(f"[boot] Loading Advanced Image Captioner ({model_type})...")
+# ---------------- GIT Image Captioner ---------------
+class GITCaptioner:
+    def __init__(self):
+        print("[boot] Loading GIT Image Captioner...")
         
         try:
             import torch
@@ -34,29 +34,15 @@ class AdvancedCaptioner:
             self.device = "cuda" if torch.cuda.is_available() else "cpu"
             print(f"[boot] Using device: {self.device}")
             
-            # Try to load the requested model, fallback to original BLIP if it fails
-            success = False
+            # Load GIT model for detailed descriptions
+            success = self._load_git()
             
-            if model_type == "blip2":
-                success = self._load_blip2()
-            elif model_type == "instructblip":
-                success = self._load_instructblip()
-            elif model_type == "blip_original":
-                self._load_original_blip()
-                self.model_type = "blip_original"
-                success = True
-            elif model_type == "blip_enhanced":
-                success = self._load_enhanced_blip()
-            elif model_type == "llava":
-                success = self._load_llava()
-            
-            # Fallback to original BLIP if advanced model fails
             if not success:
-                print(f"[boot] {model_type} failed, falling back to original BLIP...")
+                print("[boot] GIT failed, falling back to original BLIP...")
                 self._load_original_blip()
                 self.model_type = "blip_original"
             else:
-                self.model_type = model_type
+                self.model_type = "git"
             
             print(f"[boot] {self.model_type.upper()} model loaded successfully!")
             
@@ -66,87 +52,20 @@ class AdvancedCaptioner:
             self._load_original_blip()
             self.model_type = "blip_original"
     
-    def _load_blip2(self) -> bool:
-        """Load BLIP2 model with error handling"""
+    def _load_git(self) -> bool:
+        """Load GIT model for detailed descriptions"""
         try:
-            from transformers import Blip2Processor, Blip2ForConditionalGeneration
-            import torch
-            import os
-            import shutil
-            
-            # Clear ALL Hugging Face cache to fix corrupted files
-            cache_dir = os.path.expanduser("~/.cache/huggingface")
-            if os.path.exists(cache_dir):
-                print(f"[boot] Clearing corrupted Hugging Face cache: {cache_dir}")
-                try:
-                    shutil.rmtree(cache_dir, ignore_errors=True)
-                    print("[boot] Cache cleared successfully")
-                except Exception as e:
-                    print(f"[boot] Cache clearing failed: {e}")
-            
-            # Try different models in order of preference - start with more stable ones
-            models_to_try = [
-                "Salesforce/blip2-flan-t5-base",  # Smallest, most stable model first
-                "Salesforce/blip2-flan-t5-large", # Smaller, more stable model
-                "Salesforce/blip2-flan-t5-xl",    # Alternative BLIP2 model
-                "Salesforce/blip2-opt-2.7b",      # Original choice
-                "Salesforce/blip2-flan-t5-xxl"    # Another alternative
-            ]
-            
-            for model_name in models_to_try:
-                try:
-                    print(f"[boot] Trying BLIP2 model: {model_name}")
-                    
-                    # Force fresh download to avoid corrupted cache
-                    self.processor = Blip2Processor.from_pretrained(
-                        model_name,
-                        force_download=True,  # Force fresh download
-                        resume_download=False,
-                        local_files_only=False
-                    )
-                    self.model = Blip2ForConditionalGeneration.from_pretrained(
-                        model_name,
-                        torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
-                        force_download=True,  # Force fresh download
-                        resume_download=False,
-                        local_files_only=False
-                    )
-                    
-                    if self.device == "cuda":
-                        self.model = self.model.to(self.device)
-                    
-                    print(f"[boot] Successfully loaded BLIP2 model: {model_name}")
-                    return True
-                    
-                except Exception as e:
-                    print(f"[boot] Failed to load {model_name}: {e}")
-                    continue
-            
-            return False
-            
-        except Exception as e:
-            print(f"[boot] BLIP2 loading failed completely: {e}")
-            return False
-    
-    def _load_instructblip(self) -> bool:
-        """Load InstructBLIP model with error handling"""
-        try:
-            from transformers import InstructBlipProcessor, InstructBlipForConditionalGeneration
+            from transformers import GitProcessor, GitForCausalLM
             import torch
             
-            model_name = "Salesforce/instructblip-vicuna-7b"
+            # Use GIT Large for better detailed descriptions
+            model_name = "microsoft/git-large-coco"
             
-            print(f"[boot] Downloading InstructBLIP model: {model_name}")
-            self.processor = InstructBlipProcessor.from_pretrained(
+            print(f"[boot] Loading GIT model: {model_name}")
+            self.processor = GitProcessor.from_pretrained(model_name)
+            self.model = GitForCausalLM.from_pretrained(
                 model_name,
-                force_download=False,
-                resume_download=True
-            )
-            self.model = InstructBlipForConditionalGeneration.from_pretrained(
-                model_name,
-                torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
-                force_download=False,
-                resume_download=True
+                torch_dtype=torch.float16 if self.device == "cuda" else torch.float32
             )
             
             if self.device == "cuda":
@@ -155,7 +74,7 @@ class AdvancedCaptioner:
             return True
             
         except Exception as e:
-            print(f"[boot] InstructBLIP loading failed: {e}")
+            print(f"[boot] GIT loading failed: {e}")
             return False
     
     def _load_original_blip(self):
@@ -171,55 +90,6 @@ class AdvancedCaptioner:
         
         if self.device == "cuda":
             self.model = self.model.to(self.device)
-    
-    def _load_enhanced_blip(self) -> bool:
-        """Load original BLIP with enhanced parameters for better descriptions"""
-        try:
-            from transformers import BlipProcessor, BlipForConditionalGeneration
-            import torch
-            
-            model_name = "Salesforce/blip-image-captioning-large"
-            
-            print(f"[boot] Loading enhanced BLIP model: {model_name}")
-            self.processor = BlipProcessor.from_pretrained(model_name)
-            self.model = BlipForConditionalGeneration.from_pretrained(model_name)
-            
-            if self.device == "cuda":
-                self.model = self.model.to(self.device)
-            
-            self.model_type = "blip_enhanced"
-            return True
-            
-        except Exception as e:
-            print(f"[boot] Enhanced BLIP loading failed: {e}")
-            return False
-
-    def _load_llava(self) -> bool:
-        """Load LLaVA model for detailed descriptions"""
-        try:
-            from transformers import LlavaProcessor, LlavaForConditionalGeneration
-            import torch
-            
-            # Use a smaller LLaVA model that's more stable
-            model_name = "llava-hf/llava-1.5-7b-hf"
-            
-            print(f"[boot] Loading LLaVA model: {model_name}")
-            self.processor = LlavaProcessor.from_pretrained(model_name)
-            self.model = LlavaForConditionalGeneration.from_pretrained(
-                model_name,
-                torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
-                low_cpu_mem_usage=True
-            )
-            
-            if self.device == "cuda":
-                self.model = self.model.to(self.device)
-            
-            self.model_type = "llava"
-            return True
-            
-        except Exception as e:
-            print(f"[boot] LLaVA loading failed: {e}")
-            return False
 
     def caption(self, pil_img: Image.Image, detailed: bool = True, custom_prompt: str = None) -> str:
         """Generate a detailed caption for the image"""
@@ -227,20 +97,44 @@ class AdvancedCaptioner:
             import torch
             
             # Handle different model types
-            if self.model_type == "blip_original":
+            if self.model_type == "git":
+                return self._caption_git(pil_img, detailed)
+            else:  # blip_original
                 return self._caption_original_blip(pil_img, detailed)
-            elif self.model_type == "blip_enhanced":
-                return self._caption_enhanced_blip(pil_img, detailed)
-            elif self.model_type == "llava":
-                return self._caption_llava(pil_img, detailed, custom_prompt)
-            elif self.model_type == "instructblip":
-                return self._caption_instructblip(pil_img, detailed, custom_prompt)
-            else:  # blip2
-                return self._caption_blip2(pil_img, detailed)
             
         except Exception as e:
             print(f"[error] Caption generation failed: {e}")
             return "an image"
+    
+    def _caption_git(self, pil_img: Image.Image, detailed: bool) -> str:
+        """Caption using GIT model for detailed descriptions"""
+        import torch
+        
+        # GIT uses image inputs directly
+        inputs = self.processor(images=pil_img, return_tensors="pt")
+        
+        if self.device == "cuda":
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        
+        with torch.no_grad():
+            generated_ids = self.model.generate(
+                **inputs,
+                max_length=150 if detailed else 100,  # Longer for detailed descriptions
+                num_beams=5,     # Good quality
+                temperature=0.7, # Balanced creativity
+                do_sample=True,  # Allow sampling
+                early_stopping=True,
+                repetition_penalty=1.2,
+                length_penalty=1.1,
+            )
+        
+        caption = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+        caption = caption.strip()
+        
+        if not caption or caption.lower() in ["", "image", "photo", "picture"]:
+            return "an image"
+        
+        return caption
     
     def _caption_original_blip(self, pil_img: Image.Image, detailed: bool) -> str:
         """Caption using original BLIP model"""
@@ -269,159 +163,13 @@ class AdvancedCaptioner:
             return "an image"
         
         return caption
-    
-    def _caption_enhanced_blip(self, pil_img: Image.Image, detailed: bool) -> str:
-        """Caption using enhanced BLIP model with better parameters"""
-        import torch
-        
-        # Original BLIP doesn't support text prompts, just image captioning
-        inputs = self.processor(images=pil_img, return_tensors="pt")
-        
-        if self.device == "cuda":
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        
-        with torch.no_grad():
-            generated_ids = self.model.generate(
-                **inputs,
-                max_length=120 if detailed else 80,  # Much longer for detailed descriptions
-                num_beams=12,     # Much higher quality
-                temperature=0.9, # More creative
-                do_sample=True,  # Allow sampling for variety
-                early_stopping=True,
-                repetition_penalty=1.5,  # Higher penalty for repetition
-                length_penalty=1.5,     # Encourage longer descriptions
-                no_repeat_ngram_size=2,  # Avoid repetitive phrases
-            )
-        
-        caption = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
-        caption = caption.strip()
-        
-        if not caption or caption.lower() in ["", "image", "photo", "picture"]:
-            return "an image"
-        
-        return caption
-    
-    def _caption_llava(self, pil_img: Image.Image, detailed: bool, custom_prompt: str = None) -> str:
-        """Caption using LLaVA model for detailed descriptions"""
-        import torch
-        
-        if custom_prompt:
-            prompt = custom_prompt
-        elif detailed:
-            prompt = "USER: <image>\nDescribe this image in detail, including the setting, people, objects, colors, activities, and atmosphere. Be very specific about what you see.\nASSISTANT:"
-        else:
-            prompt = "USER: <image>\nWhat is in this image?\nASSISTANT:"
-        
-        inputs = self.processor(text=prompt, images=pil_img, return_tensors="pt")
-        
-        if self.device == "cuda":
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        
-            with torch.no_grad():
-                generated_ids = self.model.generate(
-                    **inputs,
-                max_length=200,  # Much longer for detailed descriptions
-                num_beams=3,
-                temperature=0.7,
-                do_sample=True,
-                    early_stopping=True,
-                    repetition_penalty=1.1,
-                )
-            
-            caption = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
-            
-        # Clean up the response
-        if "ASSISTANT:" in caption:
-            caption = caption.split("ASSISTANT:")[-1].strip()
-        
-        if not caption or caption.lower() in ["", "image", "photo", "picture"]:
-            return "an image"
-        
-        return caption
-    
-    def _caption_blip2(self, pil_img: Image.Image, detailed: bool) -> str:
-        """Caption using BLIP2 model"""
-        import torch
-        
-        if detailed:
-            prompt = "Describe this image in detail, including the setting, people, objects, colors, and activities."
-        else:
-            prompt = "A photo of"
-        
-        inputs = self.processor(images=pil_img, text=prompt, return_tensors="pt")
-        
-        if self.device == "cuda":
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        
-        with torch.no_grad():
-            generated_ids = self.model.generate(
-                **inputs,
-                max_length=120,
-                num_beams=4,
-                temperature=0.7,
-                do_sample=True,
-                early_stopping=True,
-                repetition_penalty=1.2,
-                length_penalty=1.0,
-            )
-        
-        caption = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
-        caption = caption.strip()
-        
-        if prompt in caption:
-            caption = caption.replace(prompt, "").strip()
-        
-        if not caption or caption.lower() in ["", "image", "photo", "picture"]:
-            return "an image"
-        
-        return caption
-            
-    def _caption_instructblip(self, pil_img: Image.Image, detailed: bool, custom_prompt: str = None) -> str:
-        """Caption using InstructBLIP model"""
-        import torch
-        
-        if custom_prompt:
-            prompt = custom_prompt
-        elif detailed:
-            prompt = "Describe this image in detail, including the setting, people, objects, colors, activities, and atmosphere."
-        else:
-            prompt = "What is in this image?"
-        
-        inputs = self.processor(images=pil_img, text=prompt, return_tensors="pt")
-        
-        if self.device == "cuda":
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        
-        with torch.no_grad():
-            generated_ids = self.model.generate(
-                **inputs,
-                max_length=150,
-                num_beams=4,
-                temperature=0.7,
-                do_sample=True,
-                early_stopping=True,
-                repetition_penalty=1.2,
-                length_penalty=1.0,
-            )
-        
-        caption = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
-        caption = caption.strip()
-        
-        if prompt in caption:
-            caption = caption.replace(prompt, "").strip()
-        
-        if not caption or caption.lower() in ["", "image", "photo", "picture"]:
-            return "an image"
-        
-        return caption
 
 # ---------------- FastAPI App ---------------
 app = FastAPI(title="Image Caption Service")
 
 print("[boot] Initializing...")
-# Choose model type: "blip_enhanced", "llava", "blip2", "instructblip", or "blip_original"
-MODEL_TYPE = os.getenv("MODEL_TYPE", "blip_enhanced")
-CAPTIONER = AdvancedCaptioner(model_type=MODEL_TYPE)
+# Use GIT model for detailed descriptions
+CAPTIONER = GITCaptioner()
 print("[boot] Ready!")
 
 class CaptionRequest(BaseModel):
@@ -433,7 +181,7 @@ class CaptionRequest(BaseModel):
 def health():
     return {
         "status": "ok", 
-        "service": f"advanced-{MODEL_TYPE}-captioner",
+        "service": "git-captioner",
         "actual_model": CAPTIONER.model_type,
         "device": CAPTIONER.device
     }
