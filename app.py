@@ -193,7 +193,7 @@ class AdvancedCaptioner:
         except Exception as e:
             print(f"[boot] Enhanced BLIP loading failed: {e}")
             return False
-    
+
     def _load_llava(self) -> bool:
         """Load LLaVA model for detailed descriptions"""
         try:
@@ -283,13 +283,14 @@ class AdvancedCaptioner:
         with torch.no_grad():
             generated_ids = self.model.generate(
                 **inputs,
-                max_length=80 if detailed else 60,  # Longer for detailed descriptions
-                num_beams=8,     # Higher quality
-                temperature=0.8, # More creative
+                max_length=120 if detailed else 80,  # Much longer for detailed descriptions
+                num_beams=12,     # Much higher quality
+                temperature=0.9, # More creative
                 do_sample=True,  # Allow sampling for variety
                 early_stopping=True,
-                repetition_penalty=1.3,
-                length_penalty=1.2,
+                repetition_penalty=1.5,  # Higher penalty for repetition
+                length_penalty=1.5,     # Encourage longer descriptions
+                no_repeat_ngram_size=2,  # Avoid repetitive phrases
             )
         
         caption = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
@@ -316,19 +317,19 @@ class AdvancedCaptioner:
         if self.device == "cuda":
             inputs = {k: v.to(self.device) for k, v in inputs.items()}
         
-        with torch.no_grad():
-            generated_ids = self.model.generate(
-                **inputs,
+            with torch.no_grad():
+                generated_ids = self.model.generate(
+                    **inputs,
                 max_length=200,  # Much longer for detailed descriptions
                 num_beams=3,
                 temperature=0.7,
                 do_sample=True,
-                early_stopping=True,
-                repetition_penalty=1.1,
-            )
-        
-        caption = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
-        
+                    early_stopping=True,
+                    repetition_penalty=1.1,
+                )
+            
+            caption = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+            
         # Clean up the response
         if "ASSISTANT:" in caption:
             caption = caption.split("ASSISTANT:")[-1].strip()
@@ -365,16 +366,16 @@ class AdvancedCaptioner:
             )
         
         caption = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
-        caption = caption.strip()
+            caption = caption.strip()
         
         if prompt in caption:
             caption = caption.replace(prompt, "").strip()
         
-        if not caption or caption.lower() in ["", "image", "photo", "picture"]:
-            return "an image"
-        
-        return caption
-    
+            if not caption or caption.lower() in ["", "image", "photo", "picture"]:
+                return "an image"
+            
+            return caption
+            
     def _caption_instructblip(self, pil_img: Image.Image, detailed: bool, custom_prompt: str = None) -> str:
         """Caption using InstructBLIP model"""
         import torch
@@ -418,8 +419,8 @@ class AdvancedCaptioner:
 app = FastAPI(title="Image Caption Service")
 
 print("[boot] Initializing...")
-# Choose model type: "llava", "blip_enhanced", "blip2", "instructblip", or "blip_original"
-MODEL_TYPE = os.getenv("MODEL_TYPE", "llava")
+# Choose model type: "blip_enhanced", "llava", "blip2", "instructblip", or "blip_original"
+MODEL_TYPE = os.getenv("MODEL_TYPE", "blip_enhanced")
 CAPTIONER = AdvancedCaptioner(model_type=MODEL_TYPE)
 print("[boot] Ready!")
 
