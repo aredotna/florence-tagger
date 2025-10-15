@@ -1,21 +1,23 @@
-# Simple Python base image
-FROM python:3.10-slim
+FROM pytorch/pytorch:2.2.2-cuda12.1-cudnn8-runtime
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    git \
-    && rm -rf /var/lib/apt/lists/*
+ENV DEBIAN_FRONTEND=noninteractive \
+    HF_HUB_DISABLE_SYMLINKS_WARNING=1 \
+    PYTHONUNBUFFERED=1
 
-RUN pip install --upgrade pip
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY requirements.txt ./
+RUN pip install --upgrade pip setuptools wheel && \
+    pip install --no-cache-dir -r requirements.txt
 
-# App
 COPY app.py ./
 
-ENV AWS_REGION=us-east-1
+# Defaults (override at run)
+ENV AWS_REGION=us-east-1 \
+    VLM_MODEL_ID=Qwen/Qwen2.5-VL-7B-Instruct \
+    VLM_LOAD_8BIT=false
 
 EXPOSE 8000
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]

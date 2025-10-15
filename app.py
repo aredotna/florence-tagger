@@ -1,279 +1,163 @@
-import os
-import io
+import os, io, re
 from typing import Optional
-from PIL import Image, ImageFile
-import boto3
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+from PIL import Image, ImageFile
+import boto3
 
-# Enable truncated image loading
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+VLM_MODEL_ID = os.getenv("VLM_MODEL_ID", "Qwen/Qwen2.5-VL-7B-Instruct")
+VLM_LOAD_8BIT = os.getenv("VLM_LOAD_8BIT", "false").lower() in {"1","true","yes"}
 
-# Initialize S3 client
-s3 = boto3.client('s3', region_name=AWS_REGION)
+# ---------- S3 Loader ----------
+s3 = boto3.client("s3", region_name=AWS_REGION)
 
 def s3_image(s3_uri: str) -> Image.Image:
-    """Download image from S3 and return PIL Image"""
+    if not s3_uri.startswith("s3://"):
+        raise HTTPException(400, "s3_uri must start with s3://")
     try:
-        bucket, key = s3_uri.replace("s3://", "").split("/", 1)
+        bucket, key = s3_uri[5:].split("/", 1)
         obj = s3.get_object(Bucket=bucket, Key=key)
         return Image.open(io.BytesIO(obj["Body"].read())).convert("RGB")
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to decode image: {e}")
+        raise HTTPException(400, f"Failed to fetch/decode image: {e}")
 
-# ---------------- ViT-GPT2 Image Captioner ---------------
-class ViTGPT2Captioner:
-    def __init__(self):
-        print("[boot] Loading ViT-GPT2 Image Captioner...")
-        
-        try:
-            import torch
-            
-            self.device = "cuda" if torch.cuda.is_available() else "cpu"
-            print(f"[boot] Using device: {self.device}")
-            
-            # Load ViT-GPT2 model for detailed descriptions
-            success = self._load_vit_gpt2()
-            
-            if not success:
-                print("[boot] ViT-GPT2 failed, falling back to GIT...")
-                success = self._load_git()
-                if not success:
-                    print("[boot] GIT failed, falling back to original BLIP...")
-                    self._load_original_blip()
-                    self.model_type = "blip_original"
-                else:
-                    self.model_type = "git"
-            else:
-                self.model_type = "vit_gpt2"
-            
-            print(f"[boot] {self.model_type.upper()} model loaded successfully!")
-            
-        except Exception as e:
-            print(f"[boot] Error loading models: {e}")
-            print("[boot] Falling back to original BLIP...")
-            self._load_original_blip()
-            self.model_type = "blip_original"
-    
-    def _load_vit_gpt2(self) -> bool:
-        """Load ViT-GPT2 model for detailed descriptions"""
-        try:
-            from transformers import ViTImageProcessor, VisionEncoderDecoderModel
-            import torch
-            
-            # Use ViT-GPT2 model
-            model_name = "nlpconnect/vit-gpt2-image-captioning"
-            
-            print(f"[boot] Loading ViT-GPT2 model: {model_name}")
-            self.processor = ViTImageProcessor.from_pretrained(model_name)
-            self.model = VisionEncoderDecoderModel.from_pretrained(model_name)
-            
-            if self.device == "cuda":
-                self.model = self.model.to(self.device)
-            
-            return True
-            
-        except Exception as e:
-            print(f"[boot] ViT-GPT2 loading failed: {e}")
-            return False
-    
-    def _load_git(self) -> bool:
-        """Load GIT model as fallback"""
-        try:
-            from transformers import GitProcessor, GitForCausalLM
-            import torch
-            
-            model_name = "microsoft/git-large-coco"
-            
-            print(f"[boot] Loading GIT model: {model_name}")
-            self.processor = GitProcessor.from_pretrained(model_name)
-            self.model = GitForCausalLM.from_pretrained(
-                model_name,
-                torch_dtype=torch.float16 if self.device == "cuda" else torch.float32
-            )
-            
-            if self.device == "cuda":
-                self.model = self.model.to(self.device)
-            
-            return True
-            
-        except Exception as e:
-            print(f"[boot] GIT loading failed: {e}")
-            return False
-    
-    def _load_original_blip(self):
-        """Load original BLIP model as final fallback"""
-        from transformers import BlipProcessor, BlipForConditionalGeneration
+# ---------- Qwen2.5-VL Captioner ----------
+class QwenCaptioner:
+    """
+    Instruction VLM with a prompt & decoding recipe tuned for detailed but concise captions.
+    """
+    def __init__(self, model_id: str, load_8bit: bool = False):
         import torch
-        
-        model_name = "Salesforce/blip-image-captioning-large"
-        
-        print(f"[boot] Loading original BLIP model: {model_name}")
-        self.processor = BlipProcessor.from_pretrained(model_name)
-        self.model = BlipForConditionalGeneration.from_pretrained(model_name)
-        
-        if self.device == "cuda":
+        from transformers import AutoProcessor, AutoModelForVision2Seq
+
+        self.torch = torch
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+
+        quant_kwargs = {}
+        if load_8bit and self.device == "cuda":
+            try:
+                quant_kwargs = {"load_in_8bit": True, "device_map": "auto"}
+                print("[boot] loading model in 8-bit with bitsandbytes")
+            except Exception as e:
+                print(f"[boot] 8-bit load failed: {e}; using fp16/fp32 instead")
+                quant_kwargs = {}
+
+        self.model = AutoModelForVision2Seq.from_pretrained(
+            model_id,
+            trust_remote_code=True,
+            torch_dtype=(torch.float16 if self.device == "cuda" else torch.float32),
+            **quant_kwargs
+        )
+        if not quant_kwargs:
             self.model = self.model.to(self.device)
-
-    def caption(self, pil_img: Image.Image, detailed: bool = True, custom_prompt: str = None) -> str:
-        """Generate a detailed caption for the image"""
+        self.model.eval()
         try:
-            import torch
-            
-            # Handle different model types
-            if self.model_type == "vit_gpt2":
-                return self._caption_vit_gpt2(pil_img, detailed)
-            elif self.model_type == "git":
-                return self._caption_git(pil_img, detailed)
-            else:  # blip_original
-                return self._caption_original_blip(pil_img, detailed)
-            
-        except Exception as e:
-            print(f"[error] Caption generation failed: {e}")
-            return "an image"
-    
-    def _caption_vit_gpt2(self, pil_img: Image.Image, detailed: bool) -> str:
-        """Caption using ViT-GPT2 model for detailed descriptions"""
-        import torch
-        
-        # ViT-GPT2 uses image inputs directly
-        inputs = self.processor(images=pil_img, return_tensors="pt")
-        
-        if self.device == "cuda":
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        
-        with torch.no_grad():
-            generated_ids = self.model.generate(
-                **inputs,
-                max_length=200 if detailed else 100,  # Much longer for detailed descriptions
-                num_beams=8,     # High quality beam search
-                temperature=0.8, # More creative
-                do_sample=True,  # Allow sampling
-                early_stopping=True,
-                repetition_penalty=1.3,  # Higher penalty for repetition
-                length_penalty=1.3,      # Encourage longer descriptions
-                no_repeat_ngram_size=2,   # Avoid repetitive phrases
-                min_length=40 if detailed else 20,  # Minimum length
-            )
-        
-        caption = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
-        caption = caption.strip()
-        
-        if not caption or caption.lower() in ["", "image", "photo", "picture"]:
-            return "an image"
-        
-        return caption
-    
-    def _caption_git(self, pil_img: Image.Image, detailed: bool) -> str:
-        """Caption using GIT model"""
-        import torch
-        
-        inputs = self.processor(images=pil_img, return_tensors="pt")
-        
-        if self.device == "cuda":
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        
-        with torch.no_grad():
-            generated_ids = self.model.generate(
-                **inputs,
-                max_length=150 if detailed else 100,
-                num_beams=5,
-                temperature=0.7,
-                do_sample=True,
-                early_stopping=True,
-                repetition_penalty=1.2,
-                length_penalty=1.1,
-            )
-        
-        caption = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
-        caption = caption.strip()
-        
-        if not caption or caption.lower() in ["", "image", "photo", "picture"]:
-            return "an image"
-        
-        return caption
-    
-    def _caption_original_blip(self, pil_img: Image.Image, detailed: bool) -> str:
-        """Caption using original BLIP model"""
-        import torch
-        
-        inputs = self.processor(images=pil_img, return_tensors="pt")
-        
-        if self.device == "cuda":
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        
-        with torch.no_grad():
-            generated_ids = self.model.generate(
-                **inputs,
-                max_length=60,
-                num_beams=5,
-                do_sample=False,
-                early_stopping=True,
-                repetition_penalty=1.1,
-            )
-        
-        caption = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
-        caption = caption.strip()
-        
-        if not caption or caption.lower() in ["", "image", "photo", "picture"]:
-            return "an image"
-        
-        return caption
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+        except Exception:
+            pass
 
-# ---------------- FastAPI App ---------------
-app = FastAPI(title="Image Caption Service")
+    # Strong instruction to elicit detailed, specific, single-sentence captions
+    PROMPT = (
+        "You are a precise captioner. Describe the image in ONE sentence with concrete details: "
+        "number of people, approximate age (child/teen/adult), notable clothing colors, actions, "
+        "room type and 1–3 distinctive objects (e.g., orchid, built-in shelves). "
+        "Avoid hedging like 'maybe'/'appears' and avoid moral/judgemental words. "
+        "Keep it to ~30–45 words."
+    )
 
-print("[boot] Initializing...")
-# Use ViT-GPT2 model for detailed descriptions
-CAPTIONER = ViTGPT2Captioner()
-print("[boot] Ready!")
+    def caption(self, pil_img: Image.Image) -> str:
+        """
+        Decoding tuned for specificity:
+        - num_beams for coverage
+        - low temperature for precision
+        - no_repeat_ngram_size to avoid loops
+        """
+        import torch
+        proc = self.processor
+
+        # Qwen expects chat-style messages with an image
+        messages = [
+            {"role": "system", "content": "You are a helpful visual caption assistant."},
+            {"role": "user", "content": [
+                {"type": "text", "text": self.PROMPT},
+                {"type": "image", "image": pil_img}
+            ]}
+        ]
+        inputs = proc.apply_chat_template(
+            messages, add_generation_prompt=True, tokenize=True, return_tensors="pt"
+        )
+        pixel_inputs = proc(images=pil_img, return_tensors="pt")
+
+        # move to device / match dtypes
+        dtype = next(self.model.parameters()).dtype
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        pixel_inputs = {k: (v.to(self.device, dtype=dtype) if v.dtype.is_floating_point else v.to(self.device))
+                        for k, v in pixel_inputs.items()}
+
+        gen_kwargs = dict(
+            max_new_tokens=64,
+            num_beams=5,
+            do_sample=False,
+            length_penalty=1.1,
+            no_repeat_ngram_size=3,
+        )
+
+        with torch.no_grad():
+            out = self.model.generate(
+                **inputs, **pixel_inputs, **gen_kwargs
+            )
+
+        text = proc.batch_decode(out, skip_special_tokens=True)[0]
+        text = postprocess_caption(text)
+        return text
+
+def postprocess_caption(text: str) -> str:
+    # Clean up chat prefix artifacts or stray quotes
+    t = re.sub(r"^\s*(assistant:|assistant|\"|“|”)+\s*", "", text.strip(), flags=re.IGNORECASE)
+    t = re.sub(r"\s+", " ", t)
+    # enforce one sentence-ish: keep to ~45 words
+    words = t.split()
+    if len(words) > 45:
+        t = " ".join(words[:45]).rstrip(",;:") + "."
+    if not t.endswith((".", "!", "?")):
+        t += "."
+    # Capitalize first letter
+    if t and t[0].islower():
+        t = t[0].upper() + t[1:]
+    return t
+
+# ---------- FastAPI ----------
+app = FastAPI(title="High-Detail Image Captioner (Qwen2.5-VL-7B)")
+
+print("[boot] init …")
+CAPTIONER = QwenCaptioner(VLM_MODEL_ID, VLM_LOAD_8BIT)
+print("[boot] ready.")
 
 class CaptionRequest(BaseModel):
     s3_uri: str
-    detailed: bool = True  # Default to detailed descriptions
-    custom_prompt: Optional[str] = None  # Custom prompt for InstructBLIP
+    detailed: Optional[bool] = True  # kept for compatibility; prompt already emphasizes detail
 
 @app.get("/health")
 def health():
+    import torch
     return {
-        "status": "ok", 
-        "service": "vit-gpt2-captioner",
-        "actual_model": CAPTIONER.model_type,
-        "device": CAPTIONER.device
+        "ok": True,
+        "backend": "qwen2.5-vl-7b-instruct",
+        "device": "cuda" if torch.cuda.is_available() else "cpu"
     }
 
 @app.post("/caption")
-def caption_image(req: CaptionRequest):
-    """Generate a caption for an image from S3"""
-    try:
-        # Download image from S3
-        img = s3_image(req.s3_uri)
-        
-        # Generate caption
-        caption = CAPTIONER.caption(img, detailed=req.detailed, custom_prompt=req.custom_prompt)
-        
-        return {
-            "caption": caption,
-            "s3_uri": req.s3_uri
-        }
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-# Legacy endpoint for compatibility
-@app.post("/tag")
-def tag_image(req: CaptionRequest):
-    """Legacy endpoint that returns caption only"""
+def caption(req: CaptionRequest):
     try:
         img = s3_image(req.s3_uri)
-        caption = CAPTIONER.caption(img, detailed=req.detailed, custom_prompt=req.custom_prompt)
-        
-        return {
-            "caption": caption,
-            "s3_uri": req.s3_uri
-        }
-        
+        cap = CAPTIONER.caption(img)
+        return {"caption": cap, "s3_uri": req.s3_uri}
+    except HTTPException as e:
+        raise e
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(500, str(e))
