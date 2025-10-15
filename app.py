@@ -47,6 +47,8 @@ class AdvancedCaptioner:
                 success = True
             elif model_type == "blip_enhanced":
                 success = self._load_enhanced_blip()
+            elif model_type == "llava":
+                success = self._load_llava()
             
             # Fallback to original BLIP if advanced model fails
             if not success:
@@ -191,6 +193,33 @@ class AdvancedCaptioner:
         except Exception as e:
             print(f"[boot] Enhanced BLIP loading failed: {e}")
             return False
+    
+    def _load_llava(self) -> bool:
+        """Load LLaVA model for detailed descriptions"""
+        try:
+            from transformers import LlavaProcessor, LlavaForConditionalGeneration
+            import torch
+            
+            # Use a smaller LLaVA model that's more stable
+            model_name = "llava-hf/llava-1.5-7b-hf"
+            
+            print(f"[boot] Loading LLaVA model: {model_name}")
+            self.processor = LlavaProcessor.from_pretrained(model_name)
+            self.model = LlavaForConditionalGeneration.from_pretrained(
+                model_name,
+                torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
+                low_cpu_mem_usage=True
+            )
+            
+            if self.device == "cuda":
+                self.model = self.model.to(self.device)
+            
+            self.model_type = "llava"
+            return True
+            
+        except Exception as e:
+            print(f"[boot] LLaVA loading failed: {e}")
+            return False
 
     def caption(self, pil_img: Image.Image, detailed: bool = True, custom_prompt: str = None) -> str:
         """Generate a detailed caption for the image"""
@@ -202,6 +231,8 @@ class AdvancedCaptioner:
                 return self._caption_original_blip(pil_img, detailed)
             elif self.model_type == "blip_enhanced":
                 return self._caption_enhanced_blip(pil_img, detailed)
+            elif self.model_type == "llava":
+                return self._caption_llava(pil_img, detailed, custom_prompt)
             elif self.model_type == "instructblip":
                 return self._caption_instructblip(pil_img, detailed, custom_prompt)
             else:  # blip2
@@ -263,6 +294,44 @@ class AdvancedCaptioner:
         
         caption = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
         caption = caption.strip()
+        
+        if not caption or caption.lower() in ["", "image", "photo", "picture"]:
+            return "an image"
+        
+        return caption
+    
+    def _caption_llava(self, pil_img: Image.Image, detailed: bool, custom_prompt: str = None) -> str:
+        """Caption using LLaVA model for detailed descriptions"""
+        import torch
+        
+        if custom_prompt:
+            prompt = custom_prompt
+        elif detailed:
+            prompt = "USER: <image>\nDescribe this image in detail, including the setting, people, objects, colors, activities, and atmosphere. Be very specific about what you see.\nASSISTANT:"
+        else:
+            prompt = "USER: <image>\nWhat is in this image?\nASSISTANT:"
+        
+        inputs = self.processor(text=prompt, images=pil_img, return_tensors="pt")
+        
+        if self.device == "cuda":
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        
+        with torch.no_grad():
+            generated_ids = self.model.generate(
+                **inputs,
+                max_length=200,  # Much longer for detailed descriptions
+                num_beams=3,
+                temperature=0.7,
+                do_sample=True,
+                early_stopping=True,
+                repetition_penalty=1.1,
+            )
+        
+        caption = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+        
+        # Clean up the response
+        if "ASSISTANT:" in caption:
+            caption = caption.split("ASSISTANT:")[-1].strip()
         
         if not caption or caption.lower() in ["", "image", "photo", "picture"]:
             return "an image"
@@ -349,8 +418,8 @@ class AdvancedCaptioner:
 app = FastAPI(title="Image Caption Service")
 
 print("[boot] Initializing...")
-# Choose model type: "blip_enhanced", "blip2", "instructblip", or "blip_original"
-MODEL_TYPE = os.getenv("MODEL_TYPE", "blip_enhanced")
+# Choose model type: "llava", "blip_enhanced", "blip2", "instructblip", or "blip_original"
+MODEL_TYPE = os.getenv("MODEL_TYPE", "llava")
 CAPTIONER = AdvancedCaptioner(model_type=MODEL_TYPE)
 print("[boot] Ready!")
 
