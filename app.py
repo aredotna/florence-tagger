@@ -366,15 +366,15 @@ class AdvancedCaptioner:
             )
         
         caption = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
-            caption = caption.strip()
+        caption = caption.strip()
         
         if prompt in caption:
             caption = caption.replace(prompt, "").strip()
         
-            if not caption or caption.lower() in ["", "image", "photo", "picture"]:
-                return "an image"
-            
-            return caption
+        if not caption or caption.lower() in ["", "image", "photo", "picture"]:
+            return "an image"
+        
+        return caption
             
     def _caption_instructblip(self, pil_img: Image.Image, detailed: bool, custom_prompt: str = None) -> str:
         """Caption using InstructBLIP model"""
