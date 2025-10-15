@@ -349,8 +349,8 @@ class AdvancedCaptioner:
 app = FastAPI(title="Image Caption Service")
 
 print("[boot] Initializing...")
-# Choose model type: "blip2", "instructblip", or "blip_original"
-MODEL_TYPE = os.getenv("MODEL_TYPE", "blip2")
+# Choose model type: "blip_enhanced", "blip2", "instructblip", or "blip_original"
+MODEL_TYPE = os.getenv("MODEL_TYPE", "blip_enhanced")
 CAPTIONER = AdvancedCaptioner(model_type=MODEL_TYPE)
 print("[boot] Ready!")
 
