@@ -64,11 +64,12 @@ class AdvancedCaptioner:
             from transformers import Blip2Processor, Blip2ForConditionalGeneration
             import torch
             
-            # Try different BLIP2 models in order of preference
+            # Try different models in order of preference - start with more stable ones
             models_to_try = [
-                "Salesforce/blip2-flan-t5-xl",  # Alternative BLIP2 model
-                "Salesforce/blip2-opt-2.7b",     # Original choice
-                "Salesforce/blip2-flan-t5-xxl"   # Another alternative
+                "Salesforce/blip2-flan-t5-large", # Smaller, more stable model first
+                "Salesforce/blip2-flan-t5-xl",    # Alternative BLIP2 model
+                "Salesforce/blip2-opt-2.7b",      # Original choice
+                "Salesforce/blip2-flan-t5-xxl"    # Another alternative
             ]
             
             for model_name in models_to_try:
@@ -303,7 +304,12 @@ class CaptionRequest(BaseModel):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": f"advanced-{MODEL_TYPE}-captioner"}
+    return {
+        "status": "ok", 
+        "service": f"advanced-{MODEL_TYPE}-captioner",
+        "actual_model": CAPTIONER.model_type,
+        "device": CAPTIONER.device
+    }
 
 @app.post("/caption")
 def caption_image(req: CaptionRequest):
