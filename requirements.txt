@@ -4,8 +4,9 @@ pillow==10.4.0
 boto3==1.35.14
 
 torch==2.2.2
-transformers==4.44.2
-accelerate==0.30.1
+torchvision==0.17.2
+transformers==4.46.1         # ← upgrade fixes qwen2_5_vl support
+accelerate==0.34.2
 sentencepiece==0.2.0
 protobuf==4.25.3
-bitsandbytes==0.43.3  # optional; enables 8-bit to save VRAM
+bitsandbytes==0.43.3         # optional; set VLM_LOAD_8BIT=true if you want 8-bit
