@@ -6,3 +6,5 @@ transformers==4.35.2
 torch==2.1.0
 torchvision==0.16.0
 numpy<2.0
+accelerate>=0.20.0
+bitsandbytes>=0.41.0
