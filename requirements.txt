@@ -10,3 +10,6 @@ accelerate==0.34.2
 sentencepiece==0.2.0
 protobuf==4.25.3
 bitsandbytes==0.43.3         # optional; set VLM_LOAD_8BIT=true if you want 8-bit
+
+# GPT-OSS-120B dependencies
+openai-harmony==0.1.0        # harmony response format for GPT-OSS
