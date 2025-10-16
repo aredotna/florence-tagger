@@ -171,6 +171,7 @@ class GPTOSSCaptionEnhancer:
     def enhance_caption(self, original_caption: str) -> str:
         """
         Enhance a caption using GPT-OSS-120B's reasoning capabilities.
+        Uses standard transformers functionality without harmony package.
         """
         import torch
         
@@ -181,6 +182,7 @@ class GPTOSSCaptionEnhancer:
             "high": "Analyze and improve this image caption with professional reasoning. Add specific brand names, landmarks, artwork, product models, and proper nouns. Ensure it's optimized for creative industry search while maintaining accuracy:"
         }
         
+        # Create a simple prompt without harmony format
         prompt = f"{reasoning_prompts[self.reasoning_level]}\n\nOriginal caption: {original_caption}\n\nEnhanced caption:"
         
         # Tokenize input
@@ -196,6 +198,7 @@ class GPTOSSCaptionEnhancer:
                 do_sample=True,
                 pad_token_id=self.tokenizer.eos_token_id,
                 eos_token_id=self.tokenizer.eos_token_id,
+                repetition_penalty=1.1,
             )
         
         # Decode response

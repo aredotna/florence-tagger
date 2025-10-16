@@ -5,11 +5,10 @@ boto3==1.35.14
 
 torch==2.2.2
 torchvision==0.17.2
-transformers==4.46.1         # ← upgrade fixes qwen2_5_vl support
+transformers>=4.46.1         # ← supports qwen2.5-vl
 accelerate==0.34.2
 sentencepiece==0.2.0
 protobuf==4.25.3
 bitsandbytes==0.43.3         # optional; set VLM_LOAD_8BIT=true if you want 8-bit
 
-# GPT-OSS-120B dependencies
-openai-harmony==0.1.0        # harmony response format for GPT-OSS
+# Note: GPT-OSS-120B will use transformers directly without additional packages
