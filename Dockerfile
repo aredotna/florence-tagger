@@ -22,8 +22,7 @@ COPY app.py ./
 # Defaults (override at run)
 ENV AWS_REGION=us-east-1 \
     VLM_MODEL_ID=Qwen/Qwen2.5-VL-7B-Instruct \
-    VLM_LOAD_8BIT=true \
-    USE_GPT_OSS=false
+    VLM_LOAD_8BIT=true
 
 EXPOSE 8000
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
