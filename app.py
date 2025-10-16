@@ -36,35 +36,65 @@ class QwenCaptioner:
     """
     def __init__(self, model_id: str, load_8bit: bool = False):
         import torch
-        from transformers import AutoProcessor, AutoModelForVision2Seq
+        from transformers import AutoProcessor, AutoModelForImageTextToText
 
         self.torch = torch
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+        
+        print(f"[boot] Loading Qwen2.5-VL model: {model_id}")
+        print(f"[boot] Device: {self.device}")
+        print(f"[boot] CUDA available: {torch.cuda.is_available()}")
+        if torch.cuda.is_available():
+            print(f"[boot] CUDA memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f}GB")
+        
+        # Load processor with fast processor disabled to avoid warnings
+        self.processor = AutoProcessor.from_pretrained(
+            model_id, 
+            trust_remote_code=True,
+            use_fast=False  # Disable fast processor to avoid warnings
+        )
 
+        # Configure quantization and loading
         quant_kwargs = {}
         if load_8bit and self.device == "cuda":
             try:
-                quant_kwargs = {"load_in_8bit": True, "device_map": "auto"}
-                print("[boot] loading model in 8-bit with bitsandbytes")
+                quant_kwargs = {
+                    "load_in_8bit": True, 
+                    "device_map": "auto",
+                    "low_cpu_mem_usage": True
+                }
+                print("[boot] Loading model in 8-bit with bitsandbytes")
             except Exception as e:
-                print(f"[boot] 8-bit load failed: {e}; using fp16/fp32 instead")
-                quant_kwargs = {}
+                print(f"[boot] 8-bit load failed: {e}; using fp16 instead")
+                quant_kwargs = {"low_cpu_mem_usage": True}
+        else:
+            quant_kwargs = {"low_cpu_mem_usage": True}
 
-        self.model = AutoModelForVision2Seq.from_pretrained(
+        print("[boot] Starting model loading...")
+        self.model = AutoModelForImageTextToText.from_pretrained(
             model_id,
             trust_remote_code=True,
-            torch_dtype=(torch.float16 if self.device == "cuda" else torch.float32),
+            dtype=(torch.float16 if self.device == "cuda" else torch.float32),
             **quant_kwargs
         )
-        if not quant_kwargs:
+        
+        if not quant_kwargs.get("device_map"):
+            print("[boot] Moving model to device...")
             self.model = self.model.to(self.device)
+        
         self.model.eval()
-        try:
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
-        except Exception:
-            pass
+        
+        # Optimize CUDA settings
+        if self.device == "cuda":
+            try:
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.allow_tf32 = True
+                torch.backends.cudnn.benchmark = True
+                print("[boot] CUDA optimizations enabled")
+            except Exception as e:
+                print(f"[boot] CUDA optimization warning: {e}")
+        
+        print("[boot] Qwen2.5-VL model loaded successfully")
 
     # Professional OpenAI-style captioning prompt
     PROMPT = (
@@ -219,12 +249,27 @@ class GPTOSSCaptionEnhancer:
 app = FastAPI(title="High-Detail Image Captioner (Qwen2.5-VL-7B + GPT-OSS-120B)")
 
 print("[boot] init …")
-CAPTIONER = QwenCaptioner(VLM_MODEL_ID, VLM_LOAD_8BIT)
+
+# Add memory management
+import gc
+import torch
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+    gc.collect()
+
+try:
+    CAPTIONER = QwenCaptioner(VLM_MODEL_ID, VLM_LOAD_8BIT)
+    print("[boot] Qwen2.5-VL loaded successfully")
+except Exception as e:
+    print(f"[boot] Failed to load Qwen2.5-VL: {e}")
+    print("[boot] This might be due to insufficient memory or disk space")
+    raise e
 
 # Initialize GPT-OSS enhancer if enabled
 ENHANCER = None
 if USE_GPT_OSS:
     try:
+        print("[boot] Attempting to load GPT-OSS-120B...")
         ENHANCER = GPTOSSCaptionEnhancer(GPT_OSS_MODEL_ID, GPT_OSS_REASONING_LEVEL)
         print("[boot] GPT-OSS-120B enhancer ready.")
     except Exception as e:
